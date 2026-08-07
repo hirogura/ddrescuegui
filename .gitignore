@@ -1,0 +1,34 @@
+# ログ・マップファイル（デバイス情報や実行履歴を含むため公開しない）
+logs/
+*.run.log
+*.log
+*.map
+
+# データベースファイル
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# パスワード・秘密鍵などの資格情報
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*password*
+*passwd*
+*credential*
+
+# 設定ファイル（ホスト名・ユーザー名などの個人情報を含む場合がある）
+config.json
+config.ini
+settings.json
+*.local.conf
+
+# Python キャッシュ
+__pycache__/
+*.pyc
