@@ -20,8 +20,11 @@ sudo bash /tmp/ddrescuegui-install.sh
 インストール完了後、ブラウザで以下にアクセスします。
 
 ```
-http://<サーバーのIP>:3327
+http://localhost:3327
 ```
+
+サーバーは `127.0.0.1` のみにバインドされるため、LAN からの直接アクセスはできません。
+別の PC からアクセスするには、下記の Tailscale Serve による HTTPS 公開を利用してください。
 
 `install.sh` は /opt/ddrescuegui へ自動的にインストールします。
 

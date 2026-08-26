@@ -10,7 +10,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -356,7 +356,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *a): pass
 
 if __name__ == "__main__":
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     server.daemon_threads = True
     print(f"ddrescueGUI running on port {PORT}")
     try: server.serve_forever()
