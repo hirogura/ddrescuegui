@@ -19,6 +19,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f
 .main{max-width:1200px;margin:0 auto;padding:24px}
 .card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:20px}
 .card h2{font-size:1.1em;color:#38bdf8;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.card h2 .btn-header{margin-left:auto;font-size:0.78em;padding:5px 12px}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .form-group{margin-bottom:14px}
 .form-group label{display:block;margin-bottom:6px;color:#94a3b8;font-size:0.9em}
@@ -195,7 +196,9 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
         </div>
 
         <div class="card">
-            <h2>出力</h2>
+            <h2>出力
+                <button class="btn-header" onclick="showCurrentSession()">現在のセッションを表示</button>
+            </h2>
             <div class="log-output" id="log-output">待機中...</div>
         </div>
     </div>
@@ -454,6 +457,26 @@ function updateStatus(running) {
     }
 }
 
+async function showCurrentSession() {
+    try {
+        const st = await (await fetch('/api/status')).json();
+        if (!st.log_file) { notify('表示できるセッションがありません', 'error'); return; }
+        const name = st.log_file.split('/').pop();
+        if (st.running) {
+            startLogStream(name);
+            notify('現在のセッションを表示中', 'success');
+        } else {
+            logStream = null; currentStreamLog = '';
+            const output = document.getElementById('log-output');
+            const res = await fetch('/api/log-content?name=' + encodeURIComponent(name) + '&lines=500');
+            const data = await res.json();
+            output.textContent = data.content || 'ログが空です';
+            output.scrollTop = output.scrollHeight;
+            notify('前回のセッションを表示中', 'success');
+        }
+    } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
+}
+
 async function doUpdate() {
     try {
         const st = await (await fetch('/api/status')).json();
@@ -544,6 +567,9 @@ async function checkStatus() {
         const data = await res.json();
         updateStatus(data.running);
         if (data.version) document.getElementById('version').textContent = 'v.' + data.version;
+        if (data.running && !logStream && data.log_file) {
+            startLogStream(data.log_file.split('/').pop());
+        }
         if (!data.running && currentStreamLog) {
             const output = document.getElementById('log-output');
             const logRes = await fetch('/api/log-content?name=' + encodeURIComponent(currentStreamLog));

@@ -309,8 +309,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         try:
             with open(filepath, "r", errors="replace") as f:
                 f.seek(0, 2)
+                size = f.tell()
+                start = max(0, size - 4096)
+                f.seek(start)
                 pending = ""
                 last_send = 0.0
+                initial = f.read()
+                if start > 0:
+                    nl = initial.find("\n")
+                    initial = initial[nl + 1:] if nl != -1 else ""
+                if initial:
+                    self._sse_send(initial)
+                    last_send = time.time()
                 while True:
                     chunk = f.read(8192)
                     if chunk:
