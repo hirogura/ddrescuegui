@@ -25,6 +25,14 @@ http://<サーバーのIP>:3327
 
 `install.sh` は /opt/ddrescuegui へ自動的にインストールします。
 
+Tailscale が導入済みの環境では、インストーラが自動で Tailscale Serve を設定し、
+Tailnet 内のみ HTTPS（`https://<マシン名>.<tailnet>.ts.net:3327`）で公開します。
+手動で設定する場合は以下を実行してください。
+
+```bash
+sudo tailscale serve --bg --https=3327 http://127.0.0.1:3327
+```
+
 ### 更新（アップグレード）
 
 インストールスクリプトを再度実行するだけで、GitHub の最新版に更新されます。
