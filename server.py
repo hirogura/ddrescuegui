@@ -10,7 +10,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -150,7 +150,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json(get_log_files())
         elif p.path == "/api/log-content":
             q = parse_qs(p.query)
-            name = q.get("name", [""])[0]
+            name = os.path.basename(q.get("name", [""])[0])
             lines = int(q.get("lines", ["100"])[0])
             if name:
                 fpath = os.path.join(LOG_DIR, name)
@@ -274,10 +274,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"error": f"インストーラのダウンロードに失敗しました: {e}"}); return
         try:
-            log_f = open(os.path.join(LOG_DIR, "update.log"), "w")
-            subprocess.Popen(["bash", script_path], stdout=log_f,
+            log_path = os.path.join(LOG_DIR, "update.log")
+            with open(log_path, "w") as log_f: log_f.close()
+            # systemd 管理下で別ユニット起動（サービス再起動時に道連れkillされるのを防ぐ）
+            if os.path.exists("/usr/bin/systemd-run"):
+                cmd = ["systemd-run", "--collect", "--unit=ddrescuegui-update",
+                       "--description=ddrescueGUI update",
+                       "bash", "-c", f"exec bash '{script_path}' > '{log_path}' 2>&1"]
+                out = subprocess.DEVNULL
+            else:
+                cmd = ["bash", script_path]
+                out = open(log_path, "w")
+            subprocess.Popen(cmd, stdout=out,
                 stderr=subprocess.STDOUT, start_new_session=True)
-            log_f.close()
+            if out is not subprocess.DEVNULL: out.close()
             self._json({"ok": True})
         except Exception as e:
             self._json({"error": str(e)})

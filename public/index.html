@@ -57,6 +57,8 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 .tab-content{display:none}.tab-content.active{display:block}
 .notify{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:6px;color:#fff;z-index:1000;animation:fadeIn 0.3s}
 .notify.success{background:#16a34a}.notify.error{background:#dc2626}
+.update-done{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#16a34a;color:#fff;padding:12px 18px;border-radius:8px;display:none;gap:14px;align-items:center;z-index:1000;box-shadow:0 4px 12px rgba(0,0,0,.4)}
+.update-done button{background:#fff;color:#166534;border:none;border-radius:6px;padding:6px 14px;font-weight:bold;cursor:pointer}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
 .info-panel{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:12px}
 .side-section{margin-bottom:8px}
@@ -71,7 +73,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>ddrescueGUI</h1>
-    <span id="version" class="version">v.1.1.0</span>
+    <span id="version" class="version">v.1.1.1</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
         <button class="btn-header" id="btn-update" onclick="doUpdate()">アップデート</button>
@@ -217,6 +219,10 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
     </div>
 </div>
 
+<div class="update-done" id="update-done">
+    <span id="update-done-msg"></span>
+    <button onclick="location.reload()">再読込</button>
+</div>
 <script>
 let statusPoll = null;
 let logStream = null;
@@ -477,17 +483,32 @@ async function showCurrentSession() {
     } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
 }
 
+function resetHeaderButtons() {
+    document.getElementById('btn-update').disabled = false;
+    document.getElementById('btn-update').textContent = 'アップデート';
+    document.getElementById('btn-restart').disabled = false;
+    document.getElementById('btn-restart').textContent = '再起動';
+}
+
+function showUpdateDone(msg) {
+    resetHeaderButtons();
+    document.getElementById('update-done-msg').textContent = msg;
+    document.getElementById('update-done').style.display = 'flex';
+}
+
 async function doUpdate() {
     try {
         const st = await (await fetch('/api/status')).json();
         if (st.running) { notify('レスキュー実行中はアップデートできません', 'error'); return; }
-        if (!confirm('GitHubから最新版を取得してアップデートしますか？\n完了後、自動的に再起動されます（数分かかる場合があります）。')) return;
+        if (!confirm('GitHubから最新版を取得してアップデートしますか？\n完了後、画面下部にメッセージが表示されます（数分かかる場合があります）。')) return;
+        document.getElementById('btn-update').textContent = 'アップデート中...';
+        document.getElementById('btn-update').disabled = true;
+        document.getElementById('btn-restart').disabled = true;
         const res = await fetch('/api/update', {method: 'POST'});
         const data = await res.json();
-        if (data.error) { notify('エラー: ' + data.error, 'error'); return; }
-        notify('アップデート中... 完了までそのままお待ちください', 'success');
+        if (data.error) { resetHeaderButtons(); notify('エラー: ' + data.error, 'error'); return; }
         waitForRestart(st.version);
-    } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
+    } catch(e) { resetHeaderButtons(); notify('通信エラー: ' + e.message, 'error'); }
 }
 
 async function doRestart() {
@@ -495,28 +516,39 @@ async function doRestart() {
         const st = await (await fetch('/api/status')).json();
         if (st.running) { notify('レスキュー実行中は再起動できません', 'error'); return; }
         if (!confirm('ddrescueGUIを再起動しますか？')) return;
+        document.getElementById('btn-restart').textContent = '再起動中...';
+        document.getElementById('btn-restart').disabled = true;
+        document.getElementById('btn-update').disabled = true;
         const res = await fetch('/api/restart', {method: 'POST'});
         const data = await res.json();
-        if (data.error) { notify('エラー: ' + data.error, 'error'); return; }
-        notify('再起動中...', 'success');
+        if (data.error) { resetHeaderButtons(); notify('エラー: ' + data.error, 'error'); return; }
         setTimeout(() => waitForRestart(null), 3000);
-    } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
+    } catch(e) { resetHeaderButtons(); notify('通信エラー: ' + e.message, 'error'); }
 }
 
 function waitForRestart(oldVersion) {
     const started = Date.now();
     const timer = setInterval(async () => {
         try {
-            const res = await fetch('/api/status');
-            const st = await res.json();
-            if (oldVersion === null || st.version !== oldVersion) {
-                clearInterval(timer);
-                setTimeout(() => location.reload(), 1000);
-                return;
+            const st = await (await fetch('/api/status')).json();
+            let done = false, msg = '';
+            if (oldVersion === null) {
+                done = true; msg = '再起動が完了しました';
+            } else if (st.version !== oldVersion) {
+                done = true; msg = 'アップデートが完了しました（v.' + st.version + '）';
+            } else {
+                try {
+                    const ld = await (await fetch('/api/log-content?name=update.log&lines=15')).json();
+                    if ((ld.content || '').includes('Done!')) {
+                        done = true; msg = 'すでに最新版です（v.' + st.version + '）';
+                    }
+                } catch(e2) {}
             }
+            if (done) { clearInterval(timer); showUpdateDone(msg); return; }
         } catch(e) {}
         if (Date.now() - started > 180000) {
             clearInterval(timer);
+            resetHeaderButtons();
             notify('タイムアウトしました。手動でページを再読込してください', 'error');
         }
     }, 2000);
