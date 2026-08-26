@@ -5,12 +5,18 @@ import os
 import subprocess
 import time
 import signal
+import threading
+import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
+VERSION = "1.0.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+
+INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/hirogura/ddrescuegui/main/install.sh"
+SERVICE_NAME = "ddrescuegui"
 
 running_process = None
 current_log_file = None
@@ -138,7 +144,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             for_dest = q.get("for_dest", ["0"])[0] == "1"
             self._json(get_file_info(path, for_dest) if path else {"error": "path required"}, 400 if not path else 200)
         elif p.path == "/api/status":
-            self._json({"running": running_process is not None and running_process.poll() is None, "log_file": current_log_file})
+            self._json({"running": running_process is not None and running_process.poll() is None,
+                        "log_file": current_log_file, "version": VERSION})
         elif p.path == "/api/logs":
             self._json(get_log_files())
         elif p.path == "/api/log-content":
@@ -167,6 +174,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if p.path == "/api/start": self._handle_start(data)
         elif p.path == "/api/stop": self._handle_stop()
         elif p.path == "/api/force-stop": self._handle_force_stop()
+        elif p.path == "/api/update": self._handle_update()
+        elif p.path == "/api/restart": self._handle_restart()
         else: self._json({"error": "not found"}, 404)
 
     def do_OPTIONS(self):
@@ -230,12 +239,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def _handle_stop(self):
         global running_process
         if running_process and running_process.poll() is None:
+            proc = running_process
             try:
-                os.killpg(os.getpgid(running_process.pid), signal.SIGTERM)
-                time.sleep(1)
-                if running_process.poll() is None:
-                    os.killpg(os.getpgid(running_process.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception: pass
+
+            def escalate():
+                try:
+                    if proc.poll() is None:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception: pass
+            threading.Timer(3.0, escalate).start()
             self._json({"ok": True})
         else:
             self._json({"error": "実行中のプロセスがありません"})
@@ -250,6 +264,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         else:
             self._json({"error": "実行中のプロセスがありません"})
 
+    def _handle_update(self):
+        if running_process and running_process.poll() is None:
+            self._json({"error": "レスキュー実行中はアップデートできません"}); return
+        script_path = "/tmp/ddrescuegui-install.sh"
+        try:
+            urllib.request.urlretrieve(INSTALL_SCRIPT_URL, script_path)
+            os.chmod(script_path, 0o755)
+        except Exception as e:
+            self._json({"error": f"インストーラのダウンロードに失敗しました: {e}"}); return
+        try:
+            log_f = open(os.path.join(LOG_DIR, "update.log"), "w")
+            subprocess.Popen(["bash", script_path], stdout=log_f,
+                stderr=subprocess.STDOUT, start_new_session=True)
+            log_f.close()
+            self._json({"ok": True})
+        except Exception as e:
+            self._json({"error": str(e)})
+
+    def _handle_restart(self):
+        if running_process and running_process.poll() is None:
+            self._json({"error": "レスキュー実行中は再起動できません"}); return
+
+        def do_restart():
+            try:
+                subprocess.run(["systemctl", "restart", SERVICE_NAME], timeout=30)
+            except Exception: pass
+        threading.Timer(0.5, do_restart).start()
+        self._json({"ok": True})
+
     def _sse_send(self, text):
         escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
         self.wfile.write(f"data: {escaped}\n\n".encode("utf-8"))
@@ -262,31 +305,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        interval = 0.5
         try:
             with open(filepath, "r", errors="replace") as f:
                 f.seek(0, 2)
-                buf = ""
+                pending = ""
+                last_send = 0.0
                 while True:
-                    chunk = f.read(4096)
+                    chunk = f.read(8192)
                     if chunk:
-                        buf += chunk
-                        while True:
-                            idx_n = buf.find("\n")
-                            idx_r = buf.find("\r")
-                            candidates = [i for i in (idx_n, idx_r) if i != -1]
-                            if not candidates:
-                                break
-                            idx = min(candidates)
-                            sep = buf[idx]
-                            piece = buf[:idx]
-                            buf = buf[idx + 1:]
-                            self._sse_send(piece + ("\n" if sep == "\n" else "\r"))
-                    elif running_process and running_process.poll() is None:
-                        time.sleep(0.3)
-                    else:
-                        if buf:
-                            self._sse_send(buf)
+                        pending += chunk
+                    alive = running_process is not None and running_process.poll() is None
+                    now = time.time()
+                    if pending and (not alive or now - last_send >= interval):
+                        self._sse_send(pending)
+                        pending = ""
+                        last_send = now
+                    if not alive:
                         break
+                    time.sleep(0.1)
         except (BrokenPipeError, ConnectionResetError): pass
 
     def _json(self, data, code=200):
@@ -299,7 +336,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *a): pass
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True
     print(f"ddrescueGUI running on port {PORT}")
     try: server.serve_forever()
     except KeyboardInterrupt: pass

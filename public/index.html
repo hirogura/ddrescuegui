@@ -9,6 +9,11 @@
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
 .header{background:#1e293b;padding:16px 24px;border-bottom:1px solid #334155;display:flex;align-items:center;gap:16px}
 .header h1{font-size:1.4em;color:#38bdf8}
+.header .version{color:#94a3b8;font-size:0.85em;font-weight:normal;padding-top:4px}
+.header-actions{margin-left:auto;display:flex;gap:8px;align-items:center}
+.btn-header{padding:6px 14px;border:none;border-radius:6px;background:#334155;color:#e2e8f0;font-size:0.82em;cursor:pointer;transition:all 0.2s}
+.btn-header:hover{background:#475569}
+.btn-header:disabled{opacity:0.5;cursor:not-allowed}
 .header .port{color:#64748b;font-size:0.85em}
 .main{max-width:1200px;margin:0 auto;padding:24px}
 .card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:20px}
@@ -64,7 +69,13 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>ddrescueGUI</h1>
+    <span id="version" class="version">v.1.0.0</span>
     <span class="port">Port 3327</span>
+    <div class="header-actions">
+        <button class="btn-header" id="btn-update" onclick="doUpdate()">アップデート</button>
+        <button class="btn-header" id="btn-restart" onclick="doRestart()">再起動</button>
+        <button class="btn-header" onclick="location.reload()">リフレッシュ</button>
+    </div>
     <span id="status-badge" class="status-badge status-idle">待機中</span>
 </div>
 <div class="main">
@@ -430,12 +441,61 @@ function updateStatus(running) {
         document.getElementById('btn-start').disabled = true;
         document.getElementById('btn-stop').disabled = false;
         document.getElementById('btn-force-stop').disabled = false;
+        document.getElementById('btn-update').disabled = true;
+        document.getElementById('btn-restart').disabled = true;
     } else {
         badge.textContent = '待機中'; badge.className = 'status-badge status-idle';
         document.getElementById('btn-start').disabled = false;
         document.getElementById('btn-stop').disabled = true;
         document.getElementById('btn-force-stop').disabled = true;
+        document.getElementById('btn-update').disabled = false;
+        document.getElementById('btn-restart').disabled = false;
     }
+}
+
+async function doUpdate() {
+    try {
+        const st = await (await fetch('/api/status')).json();
+        if (st.running) { notify('レスキュー実行中はアップデートできません', 'error'); return; }
+        if (!confirm('GitHubから最新版を取得してアップデートしますか？\n完了後、自動的に再起動されます（数分かかる場合があります）。')) return;
+        const res = await fetch('/api/update', {method: 'POST'});
+        const data = await res.json();
+        if (data.error) { notify('エラー: ' + data.error, 'error'); return; }
+        notify('アップデート中... 完了までそのままお待ちください', 'success');
+        waitForRestart(st.version);
+    } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
+}
+
+async function doRestart() {
+    try {
+        const st = await (await fetch('/api/status')).json();
+        if (st.running) { notify('レスキュー実行中は再起動できません', 'error'); return; }
+        if (!confirm('ddrescueGUIを再起動しますか？')) return;
+        const res = await fetch('/api/restart', {method: 'POST'});
+        const data = await res.json();
+        if (data.error) { notify('エラー: ' + data.error, 'error'); return; }
+        notify('再起動中...', 'success');
+        setTimeout(() => waitForRestart(null), 3000);
+    } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
+}
+
+function waitForRestart(oldVersion) {
+    const started = Date.now();
+    const timer = setInterval(async () => {
+        try {
+            const res = await fetch('/api/status');
+            const st = await res.json();
+            if (oldVersion === null || st.version !== oldVersion) {
+                clearInterval(timer);
+                setTimeout(() => location.reload(), 1000);
+                return;
+            }
+        } catch(e) {}
+        if (Date.now() - started > 180000) {
+            clearInterval(timer);
+            notify('タイムアウトしました。手動でページを再読込してください', 'error');
+        }
+    }, 2000);
 }
 
 let currentStreamLog = '';
@@ -482,6 +542,7 @@ async function checkStatus() {
         const res = await fetch('/api/status');
         const data = await res.json();
         updateStatus(data.running);
+        if (data.version) document.getElementById('version').textContent = 'v.' + data.version;
         if (!data.running && currentStreamLog) {
             const output = document.getElementById('log-output');
             const logRes = await fetch('/api/log-content?name=' + encodeURIComponent(currentStreamLog));
