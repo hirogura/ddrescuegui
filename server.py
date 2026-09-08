@@ -10,7 +10,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -211,6 +211,125 @@ def get_device_size_bytes(path):
     except Exception:
         pass
     return 0
+
+
+# ---- S.M.A.R.T.情報取得用ヘルパー ----
+
+def get_smart_devices():
+    """S.M.A.R.T.ページ用：接続ディスク一覧（消去ページと同等の実ディスク一覧）"""
+    devs = get_wipe_devices()
+    if devs:
+        return devs
+    # フォールバック：lsblk の disk 一覧から実デバイスのみ返す
+    out = []
+    for d in get_block_devices():
+        if WIPE_PATH_RE.match(d.get("path", "")):
+            d.setdefault("partitions", [])
+            d.setdefault("has_mount", bool(d.get("mountpoint")))
+            d.setdefault("ssd_hint", False)
+            out.append(d)
+    return out
+
+
+def get_smart_info(path):
+    """指定ディスクの S.M.A.R.T.情報を取得。smartctl の JSON + テキストを返す"""
+    if not WIPE_PATH_RE.match(path or ""):
+        return {"path": path, "available": False,
+                "error": f"不正なデバイス指定です: {path}"}
+    if not os.path.exists(path):
+        return {"path": path, "available": False,
+                "error": f"デバイスが見つかりません: {path}"}
+    # smartctl 本体の存在確認
+    try:
+        r_ver = subprocess.run(["smartctl", "--version"],
+            capture_output=True, text=True, timeout=5)
+        if r_ver.returncode != 0 and not (r_ver.stdout or ""):
+            return {"path": path, "available": False,
+                    "error": "smartctl が利用できません（smartmontools を導入してください）"}
+    except FileNotFoundError:
+        return {"path": path, "available": False,
+                "error": "smartctl が見つかりません（smartmontools を導入してください）"}
+    except Exception as e:
+        return {"path": path, "available": False, "error": f"smartctl 確認エラー: {e}"}
+
+    # JSON 形式で全情報を取得（終了コードはビットマスクのため成否判定に使わない）
+    smart_json = None
+    try:
+        r = subprocess.run(["smartctl", "-a", "-j", path],
+            capture_output=True, text=True, timeout=20)
+        raw = (r.stdout or "").strip()
+        if raw:
+            try:
+                smart_json = json.loads(raw)
+            except Exception:
+                smart_json = None
+    except subprocess.TimeoutExpired:
+        return {"path": path, "available": False, "error": "smartctl がタイムアウトしました"}
+    except Exception as e:
+        return {"path": path, "available": False, "error": f"smartctl 実行エラー: {e}"}
+
+    # テキスト形式も併せて取得（画面の「詳細」表示用）
+    text_out = ""
+    try:
+        r2 = subprocess.run(["smartctl", "-a", path],
+            capture_output=True, text=True, timeout=20)
+        text_out = (r2.stdout or "") + (r2.stderr or "")
+        text_out = text_out.strip()
+    except Exception:
+        pass
+
+    if smart_json is None and not text_out:
+        return {"path": path, "available": False,
+                "error": "S.M.A.R.T.情報を取得できませんでした"}
+
+    # 利用可否・ヘルス判定
+    available = True
+    health = "不明"
+    health_ok = None
+    support_msg = ""
+    if smart_json is not None:
+        try:
+            status = smart_json.get("smart_status") or {}
+            if "passed" in status:
+                health_ok = bool(status.get("passed"))
+                health = "正常" if health_ok else "異常あり"
+            # NVMe でも smart_status.passed が入る。無い場合は全体ステータスで補完
+            if health_ok is None:
+                # exit_status 等から推測できないため不明のまま
+                pass
+            sup = smart_json.get("smart_support") or {}
+            # smart_support.available が false の場合は S.M.A.R.T. 非対応
+            if sup.get("available") is False:
+                available = False
+                support_msg = "このディスクは S.M.A.R.T. に対応していません"
+            # デバイス open エラー時は利用不可
+            msgs = smart_json.get("messages") or []
+            for m in msgs:
+                s = (m.get("string") or "") if isinstance(m, dict) else str(m)
+                if "unable to" in s.lower() or "failed" in s.lower() or "error" in s.lower():
+                    pass
+        except Exception:
+            pass
+    # JSON が取れずテキストのみの場合、テキストから簡易判定
+    if smart_json is None and text_out:
+        low = text_out.lower()
+        if "smart support is: unavailable" in low or "device does not support smart" in low:
+            available = False
+            support_msg = "このディスクは S.M.A.R.T. に対応していません"
+        elif "smart overall-health self-assessment test result: passed" in low:
+            health, health_ok = "正常", True
+        elif "smart overall-health self-assessment test result: failed" in low:
+            health, health_ok = "異常あり", False
+
+    if not available:
+        return {"path": path, "available": False,
+                "health": health, "health_ok": health_ok,
+                "error": support_msg or "S.M.A.R.T. に対応していません",
+                "output": text_out, "data": smart_json}
+
+    return {"path": path, "available": True,
+            "health": health, "health_ok": health_ok,
+            "output": text_out, "data": smart_json}
 
 
 def _wipe_log(job, msg):
@@ -484,6 +603,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             else: self._json({"error": "name required"}, 400)
         elif p.path == "/api/wipe-devices":
             self._json(get_wipe_devices())
+        elif p.path == "/api/smart-devices":
+            self._json(get_smart_devices())
+        elif p.path == "/api/smart":
+            q = parse_qs(p.query)
+            path = q.get("path", [""])[0]
+            if not path:
+                self._json({"available": False, "error": "path required"}, 400)
+            else:
+                self._json(get_smart_info(path))
         elif p.path == "/api/wipe/status":
             with wipe_lock:
                 if wipe_job is None:

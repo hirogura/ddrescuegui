@@ -73,9 +73,10 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>ddrescueGUI</h1>
-    <span id="version" class="version">v.1.3.0</span>
+    <span id="version" class="version">v.1.4.0</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
+        <button class="btn-header" id="btn-smart" onclick="window.open('/smart.html','_blank')" style="background:#0e7490">S.M.A.R.T.情報</button>
         <button class="btn-header" id="btn-wipe" onclick="window.open('/wipe.html','_blank')" style="background:#7f1d1d">ディスク完全消去</button>
         <button class="btn-header" id="btn-update" onclick="doUpdate()">アップデート</button>
         <button class="btn-header" id="btn-restart" onclick="doRestart()">再起動</button>
