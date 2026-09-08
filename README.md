@@ -3,9 +3,9 @@
 ブラウザから ddrescue を操作できる Web インターフェースです。
 レスキュー（コピー）の実行、進行状況のリアルタイム表示、ログの管理ができます。
 
-- 動作環境: Debian / Ubuntu（systemd を使用）
+- 動作環境: Debian / Ubuntu / CachyOS（Arch 系含む）（systemd を使用）
 - デフォルトポート: **3327**
-- 使用ツール: `ddrescue`（gddrescue）, `smartmontools`, `fdisk`, `lsblk`
+- 使用ツール: `ddrescue`（Debian では `gddrescue`）, `smartmontools`, `fdisk` / `lsblk`（Arch 系では `util-linux`）, `file`, `git`
 
 ## インストール
 
@@ -27,6 +27,12 @@ http://localhost:3327
 別の PC からアクセスするには、下記の Tailscale Serve による HTTPS 公開を利用してください。
 
 `install.sh` は /opt/ddrescuegui へ自動的にインストールします。
+OS を自動判定し、Debian / Ubuntu 系では `apt-get`、CachyOS / Arch 系では `pacman` で依存パッケージを導入します。
+
+| ディストリビューション | パッケージマネージャ | 導入パッケージ |
+| --- | --- | --- |
+| Debian / Ubuntu | `apt-get` | `python3`, `gddrescue`, `smartmontools`, `fdisk`, `git` |
+| CachyOS / Arch 系 | `pacman` | `python`, `ddrescue`, `smartmontools`, `util-linux`, `file`, `git` |
 
 Tailscale が導入済みの環境では、インストーラが自動で Tailscale Serve を設定し、
 Tailnet 内のみ HTTPS（`https://<マシン名>.<tailnet>.ts.net:3327`）で公開します。
