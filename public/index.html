@@ -73,9 +73,10 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>ddrescueGUI</h1>
-    <span id="version" class="version">v.1.4.0</span>
+    <span id="version" class="version">v.1.5.0</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
+        <button class="btn-header" id="btn-clone" onclick="openClonezilla()" style="background:#166534">Clonezilla</button>
         <button class="btn-header" id="btn-smart" onclick="window.open('/smart.html','_blank')" style="background:#0e7490">S.M.A.R.T.情報</button>
         <button class="btn-header" id="btn-wipe" onclick="window.open('/wipe.html','_blank')" style="background:#7f1d1d">ディスク完全消去</button>
         <button class="btn-header" id="btn-update" onclick="doUpdate()">アップデート</button>
@@ -643,6 +644,53 @@ async function loadLogContent() {
         view.textContent = data.content || '';
         view.scrollTop = view.scrollHeight;
     } catch(e) { view.textContent = '読み込みエラー'; }
+}
+
+async function openClonezilla() {
+    const btn = document.getElementById('btn-clone');
+    try {
+        btn.disabled = true;
+        btn.textContent = '確認中...';
+        const st = await (await fetch('/api/clone/check')).json();
+        if (st.installed) {
+            window.open('/clone.html', '_blank');
+            return;
+        }
+        if (st.installing) {
+            notify('Clonezilla をインストール中です。完了後に開きます', 'success');
+            pollCloneInstall();
+            return;
+        }
+        if (!confirm('Clonezilla がインストールされていません。\nインストールして高速クローンページを開きますか？\n（clonezilla・partclone を自動導入します）')) return;
+        btn.textContent = 'インストール中...';
+        const res = await fetch('/api/clone/install', {method: 'POST'});
+        const data = await res.json();
+        if (data.error) { notify('エラー: ' + data.error, 'error'); return; }
+        notify('インストールを開始しました。完了後にページを開きます', 'success');
+        pollCloneInstall();
+    } catch(e) {
+        notify('通信エラー: ' + e.message, 'error');
+        // 念のためページは開けるようにする
+        if (confirm('状態確認に失敗しました。ページを開きますか？')) window.open('/clone.html', '_blank');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Clonezilla';
+    }
+}
+
+async function pollCloneInstall() {
+    for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+            const st = await (await fetch('/api/clone/check')).json();
+            if (st.installed) {
+                notify('インストールが完了しました', 'success');
+                window.open('/clone.html', '_blank');
+                return;
+            }
+        } catch(e) {}
+    }
+    notify('タイムアウトしました。手動で再試行してください', 'error');
 }
 
 async function init() {

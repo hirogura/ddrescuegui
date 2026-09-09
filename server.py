@@ -2,6 +2,7 @@
 import http.server
 import json
 import os
+import shutil
 import subprocess
 import time
 import signal
@@ -10,7 +11,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -332,6 +333,132 @@ def get_smart_info(path):
             "output": text_out, "data": smart_json}
 
 
+# ---- Clonezilla 高速クローン用ヘルパー ----
+clone_install_running = False
+clone_install_lock = threading.Lock()
+
+
+def get_system_disk():
+    """システムドライブ（/ が載っている物理ディスク）を /dev/xxx 形式で返す"""
+    try:
+        r = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "/"],
+            capture_output=True, text=True, timeout=5)
+        src = (r.stdout or "").strip().split("\n")[0].strip() if r.returncode == 0 else ""
+        # 「/dev/sda2[/@]」のような btrfs サブボリューム表記からデバイス部を抽出
+        if "[" in src:
+            src = src.split("[")[0]
+        if not src.startswith("/dev/"):
+            return ""
+        # パーティション → 親ディスク名を解決
+        try:
+            r2 = subprocess.run(["lsblk", "-n", "-o", "PKNAME", src],
+                capture_output=True, text=True, timeout=5)
+            parent = (r2.stdout or "").strip().split("\n")[0].strip()
+            if parent:
+                return f"/dev/{parent}"
+        except Exception:
+            pass
+        return src
+    except Exception:
+        return ""
+
+
+def get_clone_status():
+    """Clonezilla 導入状態とシステムディスクを返す"""
+    has_onthefly = shutil.which("ocs-onthefly") is not None
+    has_sr = shutil.which("ocs-sr") is not None
+    has_partclone = any(shutil.which(f"partclone.{n}") for n in
+        ("extfs", "btrfs", "xfs", "ntfs", "vfat", "exfat", "dd")) or shutil.which("partclone.dd") is not None
+    installed = has_onthefly and has_sr
+    with clone_install_lock:
+        installing = clone_install_running
+    return {"installed": installed, "installing": installing,
+        "has_onthefly": has_onthefly, "has_sr": has_sr,
+        "has_partclone": has_partclone,
+        "system_disk": get_system_disk()}
+
+
+def get_clone_devices():
+    """クローンページ用：システムドライブを除外した実ディスク一覧"""
+    sys_disk = get_system_disk()
+    devs = get_wipe_devices()
+    if not devs:
+        # フォールバック：block デバイス一覧から実デバイス＋システム除外のみ適用
+        out = []
+        for d in get_block_devices():
+            if not WIPE_PATH_RE.match(d.get("path", "")):
+                continue
+            if d.get("path") == sys_disk:
+                continue
+            d.setdefault("partitions", [])
+            d.setdefault("has_mount", bool(d.get("mountpoint")))
+            d.setdefault("size_bytes", 0)
+            out.append(d)
+        return out
+    return [d for d in devs if d.get("path") != sys_disk]
+
+
+def _split_ocs_image(path):
+    """Clonezilla イメージ指定「/dir/NAME」を (ocsroot_dir, image_name) に分割"""
+    p = (path or "").strip()
+    if not p or "/" not in p:
+        return None, None
+    img_dir = os.path.dirname(p)
+    img_name = os.path.basename(p)
+    if not img_dir or not img_name:
+        return None, None
+    # イメージ名は Clonezilla の制約上ディレクトリ名として使える文字のみ
+    if not re.match(r"^[A-Za-z0-9._-]+$", img_name):
+        return None, None
+    return img_dir, img_name
+
+
+def _run_clone_install():
+    """Clonezilla / partclone をバックグラウンドで導入する"""
+    global clone_install_running
+    log_path = os.path.join(LOG_DIR, "clone-install.log")
+    try:
+        with open(log_path, "w") as f:
+            f.write(f"=== clone tools install started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.flush()
+            # OS 判定（install.sh と同じ基準）
+            os_id, os_like = "", ""
+            try:
+                with open("/etc/os-release") as of:
+                    for line in of:
+                        if line.startswith("ID="):
+                            os_id = line.split("=", 1)[1].strip().strip('"').lower()
+                        elif line.startswith("ID_LIKE="):
+                            os_like = line.split("=", 1)[1].strip().strip('"').lower()
+            except Exception:
+                pass
+            is_arch = ("arch" in os_like) or os_id in ("arch", "cachyos") or \
+                (shutil.which("pacman") and not shutil.which("apt-get"))
+            if is_arch:
+                cmd = ["pacman", "-Sy", "--noconfirm", "--needed", "clonezilla", "partclone"]
+            else:
+                # Debian/Ubuntu 系は事前に apt-get update してから導入
+                f.write("$ apt-get update\n")
+                f.flush()
+                r0 = subprocess.run(["apt-get", "update"], stdout=f, stderr=subprocess.STDOUT, timeout=600)
+                if r0.returncode != 0:
+                    f.write(f"apt-get update failed (code={r0.returncode})\n")
+                cmd = ["apt-get", "install", "-y", "clonezilla", "partclone"]
+            f.write(f"$ {' '.join(cmd)}\n")
+            f.flush()
+            r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=3600)
+            f.write(f"\n=== finished code={r.returncode} ===\n")
+    except Exception as e:
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"install error: {e}\n")
+        except Exception:
+            pass
+    finally:
+        with clone_install_lock:
+            clone_install_running = False
+
+
 def _wipe_log(job, msg):
     """消去ジョブのログファイルに追記"""
     try:
@@ -620,6 +747,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     # 進捗スナップショットを返す
                     self._json({"running": bool(wipe_job.get("running")),
                         "job": wipe_job})
+        elif p.path == "/api/clone/check":
+            self._json(get_clone_status())
+        elif p.path == "/api/clone-devices":
+            sys_disk = get_system_disk()
+            self._json({"system_disk": sys_disk, "devices": get_clone_devices()})
         else:
             super().do_GET()
 
@@ -636,6 +768,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/restart": self._handle_restart()
         elif p.path == "/api/wipe/start": self._handle_wipe_start(data)
         elif p.path == "/api/wipe/stop": self._handle_wipe_stop()
+        elif p.path == "/api/clone/install": self._handle_clone_install()
+        elif p.path == "/api/clone/start": self._handle_clone_start(data)
+        elif p.path == "/api/clone/stop": self._handle_stop()
         else: self._json({"error": "not found"}, 404)
 
     def do_OPTIONS(self):
@@ -846,6 +981,140 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self._json({"error": "実行中の消去ジョブがありません"}); return
             wipe_job["stop"] = True
         self._json({"ok": True})
+
+    def _handle_clone_install(self):
+        global clone_install_running
+        st = get_clone_status()
+        if st["installed"]:
+            self._json({"ok": True, "already": True}); return
+        with clone_install_lock:
+            if clone_install_running:
+                self._json({"ok": True, "installing": True}); return
+            clone_install_running = True
+        if running_process and running_process.poll() is None:
+            with clone_install_lock:
+                clone_install_running = False
+            self._json({"error": "レスキュー／クローン実行中はインストールできません"}); return
+        if self._wipe_running():
+            with clone_install_lock:
+                clone_install_running = False
+            self._json({"error": "ディスク消去実行中はインストールできません"}); return
+        th = threading.Thread(target=_run_clone_install, daemon=True)
+        th.start()
+        self._json({"ok": True, "installing": True})
+
+    def _handle_clone_start(self, data):
+        global running_process, current_log_file
+        if running_process and running_process.poll() is None:
+            self._json({"error": "既に実行中です"}); return
+        if self._wipe_running():
+            self._json({"error": "ディスク消去実行中はクローンできません"}); return
+        st = get_clone_status()
+        if not st["installed"]:
+            self._json({"error": "Clonezilla がインストールされていません。先にインストールしてください"}); return
+        source = (data.get("source") or "").strip()
+        dest = (data.get("dest") or "").strip()
+        source_type = data.get("source_type", "disk")
+        dest_type = data.get("dest_type", "disk")
+        resize = bool(data.get("resize", True))
+        if not source:
+            self._json({"error": "コピー元を指定してください"}); return
+        if not dest:
+            self._json({"error": "コピー先を指定してください"}); return
+        if source_type == "disk" and dest_type == "disk" and source == dest:
+            self._json({"error": "コピー元とコピー先が同じです"}); return
+        sys_disk = get_system_disk()
+        # 最新デバイス一覧で検証
+        devs = {d["path"]: d for d in get_clone_devices()}
+        full_devs = {d["path"]: d for d in get_wipe_devices()}
+        if source_type == "disk":
+            if not WIPE_PATH_RE.match(source):
+                self._json({"error": f"不正なデバイス指定です: {source}"}); return
+            if source == sys_disk:
+                self._json({"error": f"{source} はシステムドライブのため対象外です"}); return
+            if source not in devs:
+                if source in full_devs:
+                    self._json({"error": f"{source} は使用中のため選択できません（マウント解除後に再試行）"}); return
+                self._json({"error": f"デバイスが見つかりません: {source}"}); return
+            if full_devs.get(source, {}).get("has_mount"):
+                self._json({"error": f"{source} はマウント中のパーティションを含むためクローンできません。アンマウントしてから実行してください"}); return
+        if dest_type == "disk":
+            if not WIPE_PATH_RE.match(dest):
+                self._json({"error": f"不正なデバイス指定です: {dest}"}); return
+            if dest == sys_disk:
+                self._json({"error": f"{dest} はシステムドライブのため対象外です"}); return
+            if dest not in devs:
+                if dest in full_devs:
+                    self._json({"error": f"{dest} は使用中のため選択できません（マウント解除後に再試行）"}); return
+                self._json({"error": f"デバイスが見つかりません: {dest}"}); return
+            if full_devs.get(dest, {}).get("has_mount"):
+                self._json({"error": f"{dest} はマウント中のパーティションを含むためクローンできません。アンマウントしてから実行してください"}); return
+        if source_type == "image" and dest_type == "image":
+            self._json({"error": "イメージ→イメージの変換は未対応です"}); return
+        # コピー先サイズの事前チェック（disk→disk のみ）
+        if source_type == "disk" and dest_type == "disk":
+            s_size = (devs.get(source) or {}).get("size_bytes") or get_device_size_bytes(source)
+            d_size = (devs.get(dest) or {}).get("size_bytes") or get_device_size_bytes(dest)
+            if s_size and d_size and d_size < s_size:
+                self._json({"error": f"コピー先 ({dest}) がコピー元より小さいため実行できません"}); return
+        # イメージ指定の検証
+        src_img = dst_img = None
+        if source_type == "image":
+            src_img = _split_ocs_image(source)
+            if not src_img[0] or not src_img[1]:
+                self._json({"error": "イメージ指定が不正です（例: /backup/myimage）"}); return
+            if not os.path.isdir(os.path.join(src_img[0], src_img[1])):
+                self._json({"error": f"イメージが見つかりません: {source}"}); return
+        if dest_type == "image":
+            dst_img = _split_ocs_image(dest)
+            if not dst_img[0] or not dst_img[1]:
+                self._json({"error": "イメージ指定が不正です（例: /backup/myimage）"}); return
+            if not os.path.isdir(dst_img[0]):
+                self._json({"error": f"保存先ディレクトリが見つかりません: {dst_img[0]}"}); return
+        # コマンド組み立て（使用中セクタのみ＝partclone ベースの Clonezilla 方式）
+        if source_type == "disk" and dest_type == "disk":
+            src_base = os.path.basename(source)
+            dst_base = os.path.basename(dest)
+            cmd = ["stdbuf", "-o0", "-e0", "ocs-onthefly",
+                "--batch", "--nogui", "-e1", "auto", "-e2", "-j2", "-sfsck",
+                "-k1" if resize else "-k0"]
+            if resize:
+                cmd.append("-r")
+            cmd += ["-p", "true", "-f", src_base, "-d", dst_base]
+            tag = f"{src_base}_to_{dst_base}"
+        elif source_type == "disk" and dest_type == "image":
+            src_base = os.path.basename(source)
+            cmd = ["stdbuf", "-o0", "-e0", "ocs-sr",
+                "--batch", "--nogui", "-q2", "-c", "-j2", "-z0", "-sfsck",
+                "-p", "true", "-or", dst_img[0], "savedisk", dst_img[1], src_base]
+            tag = f"{src_base}_to_img"
+        else:  # image -> disk
+            dst_base = os.path.basename(dest)
+            cmd = ["stdbuf", "-o0", "-e0", "ocs-sr",
+                "--batch", "--nogui", "-e1", "auto", "-e2", "-j2", "-sfsck",
+                "-g", "auto", "-p", "true"]
+            if resize:
+                cmd += ["-r", "-k1"]
+            else:
+                cmd += ["-k0"]
+            cmd += ["-or", src_img[0], "restoredisk", src_img[1], dst_base]
+            tag = f"img_to_{dst_base}"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_name = f"clone_{tag}_{timestamp}.log"
+        current_log_file = os.path.join(LOG_DIR, log_name)
+        try:
+            log_f = open(current_log_file, "w")
+            log_f.write(f"=== clone started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            log_f.write(f"Command: {' '.join(cmd)}\n")
+            log_f.write(f"source={source} ({source_type}) dest={dest} ({dest_type}) resize={resize}\n\n")
+            log_f.flush()
+            running_process = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+            log_f.close()
+            self._json({"ok": True, "log_file": log_name, "pid": running_process.pid})
+        except FileNotFoundError as e:
+            self._json({"error": f"Clonezilla コマンドが見つかりません: {e}"})
+        except Exception as e:
+            self._json({"error": str(e)})
 
     def _sse_send(self, text):
         escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
