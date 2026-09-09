@@ -11,7 +11,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -336,9 +336,56 @@ def get_smart_info(path):
 # ---- Clonezilla 高速クローン用ヘルパー ----
 clone_install_running = False
 clone_install_lock = threading.Lock()
-# 実行中クローンのメタ情報（進捗表示用）
+# 実行中クローンのメタ情報（進捗表示用。サービス再起動に備えてファイルにも保存）
 clone_job = None
 clone_lock = threading.Lock()
+CLONE_JOB_FILE = os.path.join(LOG_DIR, ".clone_job.json")
+
+
+def _save_clone_job(job):
+    """クローンジョブ情報をメモリ＋ファイルに保存する"""
+    global clone_job
+    with clone_lock:
+        clone_job = job
+    try:
+        with open(CLONE_JOB_FILE, "w") as f:
+            json.dump(job, f)
+    except Exception:
+        pass
+
+
+def _load_clone_job():
+    """メモリ優先、無ければファイルからクローンジョブ情報を復元する"""
+    with clone_lock:
+        if clone_job is not None:
+            return dict(clone_job)
+    try:
+        if os.path.exists(CLONE_JOB_FILE):
+            with open(CLONE_JOB_FILE, "r") as f:
+                job = json.load(f)
+            if isinstance(job, dict) and job.get("log_path"):
+                return job
+    except Exception:
+        pass
+    return None
+
+
+def _pid_is_clone(pid):
+    """指定 pid がクローン関係プロセス（ocs/partclone/stdbuf 経由）か確認する。PID 再利用の誤認防止用"""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            cmd = f.read().decode(errors="replace").lower()
+        return ("ocs-" in cmd) or ("partclone" in cmd) or ("stdbuf" in cmd)
+    except Exception:
+        # cmdline が読めない＝権限等の例外時は生存のみで判断する
+        return True
 
 
 def get_system_disk():
@@ -457,10 +504,16 @@ def _fmt_eta(sec):
 
 def get_clone_progress():
     """実行中クローンの進捗をログ解析で推定する。partclone の出力形式を利用"""
-    with clone_lock:
-        job = dict(clone_job) if clone_job else None
-    running = running_process is not None and running_process.poll() is None
-    rc = None if running_process is None else running_process.poll()
+    job = _load_clone_job()
+    adopted = False
+    if running_process is not None and running_process.poll() is None:
+        running, rc = True, None
+    elif job and job.get("pid") and _pid_is_clone(job.get("pid")):
+        # サービス再起動後に取り残されたプロセスを引き継いで追跡する
+        running, rc, adopted = True, None, True
+    else:
+        running = False
+        rc = None if running_process is None else running_process.poll()
     if not job:
         return {"running": running, "job": None}
     log_file = job.get("log_path", "")
@@ -514,14 +567,36 @@ def get_clone_progress():
     total_ops = job.get("total_ops") or (done_ops + 1)
     if total_ops <= 0:
         total_ops = done_ops + 1
+    # 現在のフェーズ（ocs の節目行から直近のものを抜粋。partclone 無出力の序盤対策）
+    phase = ""
+    try:
+        noise_re = re.compile(
+            r"Complete:\s*[\d.]+%|Current block:|records (in|out)|copied,|^\s*$|"
+            r"^\*+$|TERM as linux|color|^\[[0-9;]+m?")
+        cands = [ln.strip()[:110] for ln in text.split("\n") if ln.strip() and not noise_re.search(ln)]
+        if cands:
+            phase = cands[-1]
+    except Exception:
+        pass
     if not running:
         # 終了時：正常終了なら 100%、異常なら最終推定値で止める
-        if rc == 0 and not failed:
+        if (rc == 0 or (rc is None and done_ops >= total_ops)) and not failed:
             overall = 100.0
         else:
             overall = round(min(99.9, (done_ops + cur_frac) / total_ops * 100.0), 1)
     else:
         overall = round(min(99.9, (done_ops + cur_frac) / total_ops * 100.0), 1)
+    # 状態判定（フロント表示用）
+    if running:
+        status = "running"
+    elif failed:
+        status = "error"
+    elif rc == 0 or (rc is None and done_ops >= total_ops and overall >= 99.9):
+        status = "done"
+    elif rc is None:
+        status = "unknown"
+    else:
+        status = "error"
     elapsed = int(time.time() - job.get("started_at", time.time()))
     eta_text = "残り時間: 計算中"
     if running and overall >= 1.0:
@@ -529,13 +604,15 @@ def get_clone_progress():
             eta_text = _fmt_eta(elapsed * (100.0 - overall) / overall)
         except Exception:
             pass
-    if not running and rc == 0 and not failed:
+    if status == "done":
         eta_text = "完了"
     return {"running": running, "returncode": rc, "failed": failed,
+        "status": status, "adopted": adopted,
         "overall_percent": overall, "current_percent": round(cur_frac * 100.0, 1),
         "done_ops": done_ops, "total_ops": total_ops,
         "current_device": cur_dev, "op_remaining": op_remaining,
-        "rate": rate_text, "eta_text": eta_text, "elapsed_sec": elapsed,
+        "rate": rate_text, "phase": phase,
+        "eta_text": eta_text, "elapsed_sec": elapsed,
         "parts": job.get("parts", []), "log_file": job.get("log_file", "")}
 
 
@@ -852,7 +929,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 wrun = wipe_job is not None and bool(wipe_job.get("running"))
             self._json({"running": running_process is not None and running_process.poll() is None,
                         "log_file": current_log_file, "version": VERSION,
-                        "wipe_running": wrun})
+                        "wipe_running": wrun,
+                        "clone_running": self._any_running()})
         elif p.path == "/api/logs":
             self._json(get_log_files())
         elif p.path == "/api/log-content":
@@ -930,7 +1008,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_start(self, data):
         global running_process, current_log_file
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             self._json({"error": "既に実行中です"}); return
         if self._wipe_running():
             self._json({"error": "ディスク消去実行中はレスキューできません"}); return
@@ -981,6 +1059,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"error": str(e)})
 
+    def _adopted_clone_pid(self):
+        """サービス再起動後に取り残されたクローンプロセスの pid を返す（無ければ None）"""
+        if running_process is not None and running_process.poll() is None:
+            return None  # 自プロセスで管理中
+        job = _load_clone_job()
+        if job and job.get("pid") and _pid_is_clone(job.get("pid")):
+            return int(job.get("pid"))
+        return None
+
+    def _any_running(self):
+        """自管理プロセスまたは引き継ぎクローンのいずれかが実行中か"""
+        if running_process is not None and running_process.poll() is None:
+            return True
+        return self._adopted_clone_pid() is not None
+
     def _handle_stop(self):
         global running_process
         if running_process and running_process.poll() is None:
@@ -996,8 +1089,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 except Exception: pass
             threading.Timer(3.0, escalate).start()
             self._json({"ok": True})
-        else:
-            self._json({"error": "実行中のプロセスがありません"})
+            return
+        pid = self._adopted_clone_pid()
+        if pid:
+            # 再起動後に引き継いだプロセスはプロセスグループごと停止する
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except Exception: pass
+
+            def escalate_adopted():
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except Exception: pass
+            threading.Timer(3.0, escalate_adopted).start()
+            self._json({"ok": True, "adopted": True})
+            return
+        self._json({"error": "実行中のプロセスがありません"})
 
     def _handle_force_stop(self):
         global running_process
@@ -1006,11 +1113,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 os.killpg(os.getpgid(running_process.pid), signal.SIGKILL)
             except Exception: pass
             self._json({"ok": True})
-        else:
-            self._json({"error": "実行中のプロセスがありません"})
+            return
+        pid = self._adopted_clone_pid()
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except Exception: pass
+            self._json({"ok": True, "adopted": True})
+            return
+        self._json({"error": "実行中のプロセスがありません"})
 
     def _handle_update(self):
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             self._json({"error": "レスキュー実行中はアップデートできません"}); return
         if self._wipe_running():
             self._json({"error": "ディスク消去実行中はアップデートできません"}); return
@@ -1040,7 +1154,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json({"error": str(e)})
 
     def _handle_restart(self):
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             self._json({"error": "レスキュー実行中は再起動できません"}); return
         if self._wipe_running():
             self._json({"error": "ディスク消去実行中は再起動できません"}); return
@@ -1054,7 +1168,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_wipe_start(self, data):
         global wipe_job
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             self._json({"error": "レスキュー実行中は消去できません"}); return
         with wipe_lock:
             if wipe_job is not None and bool(wipe_job.get("running")):
@@ -1135,7 +1249,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if clone_install_running:
                 self._json({"ok": True, "installing": True}); return
             clone_install_running = True
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             with clone_install_lock:
                 clone_install_running = False
             self._json({"error": "レスキュー／クローン実行中はインストールできません"}); return
@@ -1149,7 +1263,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_clone_start(self, data):
         global running_process, current_log_file, clone_job
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             self._json({"error": "既に実行中です"}); return
         if self._wipe_running():
             self._json({"error": "ディスク消去実行中はクローンできません"}); return
@@ -1269,9 +1383,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             log_f.flush()
             running_process = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
             log_f.close()
-            with clone_lock:
-                clone_job = {"mode": mode, "parts": parts, "total_ops": total_ops,
-                    "started_at": time.time(), "log_file": log_name, "log_path": current_log_file}
+            _save_clone_job({"mode": mode, "parts": parts, "total_ops": total_ops,
+                "started_at": time.time(), "log_file": log_name, "log_path": current_log_file,
+                "pid": running_process.pid})
             self._json({"ok": True, "log_file": log_name, "pid": running_process.pid})
         except FileNotFoundError as e:
             self._json({"error": f"Clonezilla コマンドが見つかりません: {e}"})
@@ -1280,7 +1394,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_clone_unmount(self, data):
         """指定ディスク配下のマウントをすべて解除する（システムドライブは保護）"""
-        if running_process and running_process.poll() is None:
+        if self._any_running():
             self._json({"error": "実行中はアンマウントできません"}); return
         if self._wipe_running():
             self._json({"error": "ディスク消去実行中はアンマウントできません"}); return

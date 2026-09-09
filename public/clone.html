@@ -71,7 +71,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>Clonezilla 高速クローン</h1>
-    <span class="version">v.1.6.1</span>
+    <span class="version">v.1.6.2</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
@@ -437,6 +437,7 @@ async function stopClone() {
     try {
         await fetch('/api/clone/stop', {method: 'POST'});
         notify('中断しました', 'success');
+        suppressDoneNotify = true;
         updateStatus(false);
         refreshProgress();
     } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
@@ -447,6 +448,7 @@ async function forceStopClone() {
     try {
         await fetch('/api/force-stop', {method: 'POST'});
         notify('強制停止しました', 'success');
+        suppressDoneNotify = true;
         updateStatus(false);
         refreshProgress();
     } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
@@ -502,6 +504,7 @@ function startLogStream(logName) {
 
 let progTimer = null;
 let progDoneNotified = false;
+let suppressDoneNotify = false;
 
 function fmtElapsed(sec) {
     sec = Math.max(0, Math.floor(sec || 0));
@@ -513,6 +516,7 @@ function fmtElapsed(sec) {
 
 function startProgPoll() {
     progDoneNotified = false;
+    suppressDoneNotify = false;
     document.getElementById('prog-card').style.display = 'block';
     document.getElementById('prog').classList.remove('done', 'error');
     document.getElementById('prog-fill').style.width = '0%';
@@ -541,24 +545,23 @@ async function refreshProgress() {
         }
         const p = await res.json();
         if (!p.job) {
-            // サーバー再起動等でジョブ情報が無い場合は理由を表示して止める
+            // ジョブ情報が無い場合（開始前のポーリング等）は理由を表示して止める
             stopProgPoll();
             if (document.getElementById('prog-pct').textContent === '0.0 %') {
                 document.getElementById('prog-label').textContent = '進捗情報なし';
                 document.getElementById('prog-sub').textContent =
-                    '進捗情報を取得できませんでした（サーバー再起動後の実行分のみ表示できます）。出力ログで確認してください。';
+                    '進捗情報を取得できませんでした。開始直後の場合は「開始」を押し直すか、出力ログで確認してください。';
             }
             return;
         }
         renderProgress(p);
         if (!p.running) {
             stopProgPoll();
-            if (!progDoneNotified) {
+            if (!progDoneNotified && !suppressDoneNotify) {
                 progDoneNotified = true;
-                if (p.returncode === 0 && !p.failed) notify('クローンが完了しました', 'success');
-                else if (p.failed || (p.returncode !== null && p.returncode !== 0)) {
-                    notify('クローンが異常終了しました（出力ログを確認してください）', 'error');
-                }
+                if (p.status === 'done') notify('クローンが完了しました', 'success');
+                else if (p.status === 'error') notify('クローンが異常終了しました（出力ログを確認してください）', 'error');
+                else notify('クローンは終了しました（結果不明のため出力ログを確認してください）', 'error');
             }
         }
     } catch(e) {}
@@ -571,8 +574,10 @@ function renderProgress(p) {
     const box = document.getElementById('prog');
     box.classList.remove('done', 'error');
     let label = '実行中...';
+    if (p.adopted && p.running) label += '（サーバー再起動後に引き継ぎ）';
     if (!p.running) {
-        if (p.returncode === 0 && !p.failed) { label = '完了'; box.classList.add('done'); }
+        if (p.status === 'done') { label = '完了'; box.classList.add('done'); }
+        else if (p.status === 'unknown') { label = '終了（結果不明）'; box.classList.add('error'); }
         else { label = '異常終了'; box.classList.add('error'); }
     } else if (p.current_device) {
         label = '処理中: ' + p.current_device + '（' + Number(p.current_percent || 0).toFixed(1) + ' %）';
@@ -584,6 +589,7 @@ function renderProgress(p) {
     if (p.rate) sub += ' ｜ ' + p.rate;
     if (p.op_remaining) sub += ' ｜ この工程の残り ' + p.op_remaining;
     sub += ' ｜ 経過 ' + fmtElapsed(p.elapsed_sec) + ' ｜ ' + (p.eta_text || '');
+    if (p.phase) sub += '\n状況: ' + p.phase;
     document.getElementById('prog-sub').textContent = sub;
 }
 
@@ -591,7 +597,8 @@ async function checkStatus() {
     try {
         const res = await fetch('/api/status');
         const data = await res.json();
-        updateStatus(data.running);
+        const busy = !!(data.running || data.clone_running);
+        updateStatus(busy);
         // ヘッダのバージョンはサーバー（稼働中プロセス）の実バージョンで上書きする。
         // 古いままならサービス再起動が必要と判断できる
         if (data.version) {
@@ -600,11 +607,12 @@ async function checkStatus() {
         if (data.running && !logStream && data.log_file) {
             startLogStream(data.log_file.split('/').pop());
         }
-        // 別タブ開始・リロード後に実行中だった場合は進捗ポーリングも復帰させる
-        if (data.running && !progTimer) {
+        // 別タブ開始・リロード後・サーバー再起動後に実行中だった場合は進捗ポーリングも復帰させる
+        if (busy && !progTimer) {
             try {
                 const pr = await (await fetch('/api/clone/progress')).json();
                 if (pr.job) {
+                    if (!logStream && pr.log_file) startLogStream(pr.log_file);
                     document.getElementById('prog-card').style.display = 'block';
                     progTimer = setInterval(refreshProgress, 2000);
                     refreshProgress();
