@@ -11,7 +11,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -336,6 +336,9 @@ def get_smart_info(path):
 # ---- Clonezilla 高速クローン用ヘルパー ----
 clone_install_running = False
 clone_install_lock = threading.Lock()
+# 実行中クローンのメタ情報（進捗表示用）
+clone_job = None
+clone_lock = threading.Lock()
 
 
 def get_system_disk():
@@ -411,6 +414,129 @@ def get_whole_disk_fstype(path):
         return fstype
     except Exception:
         return ""
+
+
+def get_disk_mountpoints(path):
+    """指定ディスク配下のマウントポイント・swap 使用状況を返す [(dev, mp)]。mpが [SWAP] のものは swap"""
+    out = []
+    try:
+        r = subprocess.run(["lsblk", "-J", "-o", "NAME,MOUNTPOINT", path],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return out
+        data = json.loads(r.stdout or "{}")
+
+        def walk(nodes):
+            for n in nodes or []:
+                name = n.get("name", "")
+                mp = n.get("mountpoint") or ""
+                if name and mp:
+                    out.append((f"/dev/{name}", mp))
+                walk(n.get("children") or [])
+        walk(data.get("blockdevices", []))
+    except Exception:
+        pass
+    return out
+
+
+def _fmt_eta(sec):
+    """残り秒数をおおよその日本語表記にする"""
+    if sec is None or sec < 0:
+        return "残り時間: 計算中"
+    sec = int(sec)
+    if sec < 10:
+        return "まもなく完了"
+    if sec < 60:
+        return f"残り約 {sec} 秒"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"残り約 {m} 分 {s} 秒"
+    h, m = divmod(m, 60)
+    return f"残り約 {h} 時間 {m} 分"
+
+
+def get_clone_progress():
+    """実行中クローンの進捗をログ解析で推定する。partclone の出力形式を利用"""
+    with clone_lock:
+        job = dict(clone_job) if clone_job else None
+    running = running_process is not None and running_process.poll() is None
+    rc = None if running_process is None else running_process.poll()
+    if not job:
+        return {"running": running, "job": None}
+    log_file = job.get("log_path", "")
+    text = ""
+    try:
+        if log_file and os.path.exists(log_file):
+            with open(log_file, "r", errors="replace") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                text = f.read()
+    except Exception:
+        pass
+    # 制御文字・ANSIエスケープを除去し、\r を改行扱いにする
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text).replace("\r", "\n")
+    # 完了した partclone 処理数（保存・復元とも "Total Time: ..., 100.00% completed!" で1件）
+    done_ops = len(re.findall(r"Total Time:.*?100\.00% completed!", text))
+    failed = ("Partclone fail" in text) or ("プログラム中断" in text)
+    # 現在の処理の進捗（Current block 優先、なければ Complete/Completed %）
+    cur_frac = 0.0
+    blocks = re.findall(r"Current block:\s*(\d+),\s*Total block:\s*(\d+)", text)
+    if blocks:
+        cur, tot = blocks[-1]
+        try:
+            cur_frac = min(1.0, max(0.0, int(cur) / int(tot))) if int(tot) > 0 else 0.0
+        except Exception:
+            cur_frac = 0.0
+    else:
+        pcts = re.findall(r"Complete:\s*([\d.]+)\s*%", text)
+        if pcts:
+            try:
+                cur_frac = min(1.0, max(0.0, float(pcts[-1]) / 100.0))
+            except Exception:
+                cur_frac = 0.0
+    # partclone 自身の残り時間・速度表示
+    rems = re.findall(r"Remaining:\s*([0-9:]+)", text)
+    op_remaining = rems[-1] if rems else ""
+    rates = re.findall(r"Rate:\s*([0-9.]+\s*[KMGT]?B/min)", text)
+    rate_text = rates[-1] if rates else ""
+    # 現在処理中のデバイス（直近の開始行から）
+    cur_dev = ""
+    saves = re.findall(r"Starting to clone device \(([^)]+)\)", text)
+    restores = re.findall(r"Starting to restore image \([^)]*\) to device \(([^)]+)\)", text)
+    # 時系列順は取れないため、テキスト上の最終出現位置で判定
+    last_save = text.rfind("Starting to clone device (")
+    last_restore = text.rfind("Starting to restore image (")
+    if last_restore >= 0 and last_restore >= last_save and restores:
+        cur_dev = restores[-1]
+    elif saves:
+        cur_dev = saves[-1]
+    total_ops = job.get("total_ops") or (done_ops + 1)
+    if total_ops <= 0:
+        total_ops = done_ops + 1
+    if not running:
+        # 終了時：正常終了なら 100%、異常なら最終推定値で止める
+        if rc == 0 and not failed:
+            overall = 100.0
+        else:
+            overall = round(min(99.9, (done_ops + cur_frac) / total_ops * 100.0), 1)
+    else:
+        overall = round(min(99.9, (done_ops + cur_frac) / total_ops * 100.0), 1)
+    elapsed = int(time.time() - job.get("started_at", time.time()))
+    eta_text = "残り時間: 計算中"
+    if running and overall >= 1.0:
+        try:
+            eta_text = _fmt_eta(elapsed * (100.0 - overall) / overall)
+        except Exception:
+            pass
+    if not running and rc == 0 and not failed:
+        eta_text = "完了"
+    return {"running": running, "returncode": rc, "failed": failed,
+        "overall_percent": overall, "current_percent": round(cur_frac * 100.0, 1),
+        "done_ops": done_ops, "total_ops": total_ops,
+        "current_device": cur_dev, "op_remaining": op_remaining,
+        "rate": rate_text, "eta_text": eta_text, "elapsed_sec": elapsed,
+        "parts": job.get("parts", []), "log_file": job.get("log_file", "")}
 
 
 def _split_ocs_image(path):
@@ -767,6 +893,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/clone-devices":
             sys_disk = get_system_disk()
             self._json({"system_disk": sys_disk, "devices": get_clone_devices()})
+        elif p.path == "/api/clone/progress":
+            self._json(get_clone_progress())
         else:
             super().do_GET()
 
@@ -785,6 +913,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/wipe/stop": self._handle_wipe_stop()
         elif p.path == "/api/clone/install": self._handle_clone_install()
         elif p.path == "/api/clone/start": self._handle_clone_start(data)
+        elif p.path == "/api/clone/unmount": self._handle_clone_unmount(data)
         elif p.path == "/api/clone/stop": self._handle_stop()
         else: self._json({"error": "not found"}, 404)
 
@@ -1019,7 +1148,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._json({"ok": True, "installing": True})
 
     def _handle_clone_start(self, data):
-        global running_process, current_log_file
+        global running_process, current_log_file, clone_job
         if running_process and running_process.poll() is None:
             self._json({"error": "既に実行中です"}); return
         if self._wipe_running():
@@ -1052,7 +1181,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     self._json({"error": f"{source} は使用中のため選択できません（マウント解除後に再試行）"}); return
                 self._json({"error": f"デバイスが見つかりません: {source}"}); return
             if full_devs.get(source, {}).get("has_mount"):
-                self._json({"error": f"{source} はマウント中のパーティションを含むためクローンできません。アンマウントしてから実行してください"}); return
+                self._json({"error": f"{source} はマウント中のため実行できません", "unmountable": [source]}); return
             # ディスク全体にファイルシステムがある媒体（Live USB のハイブリッド ISO 等）は
             # Clonezilla が「パーティション」と判定してディスク間クローンを拒否するため事前に案内する
             src_fs = get_whole_disk_fstype(source)
@@ -1069,7 +1198,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     self._json({"error": f"{dest} は使用中のため選択できません（マウント解除後に再試行）"}); return
                 self._json({"error": f"デバイスが見つかりません: {dest}"}); return
             if full_devs.get(dest, {}).get("has_mount"):
-                self._json({"error": f"{dest} はマウント中のパーティションを含むためクローンできません。アンマウントしてから実行してください"}); return
+                self._json({"error": f"{dest} はマウント中のため実行できません", "unmountable": [dest]}); return
         if source_type == "image" and dest_type == "image":
             self._json({"error": "イメージ→イメージの変換は未対応です"}); return
         # コピー先サイズの事前チェック（disk→disk のみ）
@@ -1123,6 +1252,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         log_name = f"clone_{tag}_{timestamp}.log"
         current_log_file = os.path.join(LOG_DIR, log_name)
+        # 進捗表示用メタ情報（disk→disk は保存＋復元の2工程/パーティション）
+        if source_type == "disk" and dest_type == "disk":
+            mode, parts = "disk2disk", [p.get("path", "") for p in (devs.get(source) or {}).get("partitions", [])]
+            total_ops = 2 * max(1, len(parts))
+        elif source_type == "disk":
+            mode, parts = "disk2img", [p.get("path", "") for p in (devs.get(source) or {}).get("partitions", [])]
+            total_ops = max(1, len(parts))
+        else:
+            mode, parts, total_ops = "img2disk", [], 0  # 復元のみ。総工程数は進行に応じて適応
         try:
             log_f = open(current_log_file, "w")
             log_f.write(f"=== clone started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
@@ -1131,11 +1269,76 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             log_f.flush()
             running_process = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
             log_f.close()
+            with clone_lock:
+                clone_job = {"mode": mode, "parts": parts, "total_ops": total_ops,
+                    "started_at": time.time(), "log_file": log_name, "log_path": current_log_file}
             self._json({"ok": True, "log_file": log_name, "pid": running_process.pid})
         except FileNotFoundError as e:
             self._json({"error": f"Clonezilla コマンドが見つかりません: {e}"})
         except Exception as e:
             self._json({"error": str(e)})
+
+    def _handle_clone_unmount(self, data):
+        """指定ディスク配下のマウントをすべて解除する（システムドライブは保護）"""
+        if running_process and running_process.poll() is None:
+            self._json({"error": "実行中はアンマウントできません"}); return
+        if self._wipe_running():
+            self._json({"error": "ディスク消去実行中はアンマウントできません"}); return
+        targets_in = data.get("devices", [])
+        if not targets_in:
+            self._json({"error": "対象ディスクを指定してください"}); return
+        sys_disk = get_system_disk()
+        devs = {d["path"]: d for d in get_wipe_devices()}
+        results = []
+        all_ok = True
+        for raw in targets_in:
+            path = (raw or "").strip()
+            if not WIPE_PATH_RE.match(path):
+                results.append({"path": path, "ok": False, "error": f"不正なデバイス指定です: {path}"})
+                all_ok = False
+                continue
+            if path == sys_disk:
+                results.append({"path": path, "ok": False, "error": f"{path} はシステムドライブのため対象外です"})
+                all_ok = False
+                continue
+            if path not in devs:
+                results.append({"path": path, "ok": False, "error": f"デバイスが見つかりません: {path}"})
+                all_ok = False
+                continue
+            mounts = get_disk_mountpoints(path)
+            if not mounts:
+                results.append({"path": path, "ok": True, "unmounted": [], "message": "マウントされていません"})
+                continue
+            unmounted = []
+            err = ""
+            # 深いマウントから順に解除（swap は swapoff）
+            for dev, mp in sorted(mounts, key=lambda x: len(x[1]), reverse=True):
+                try:
+                    if mp.startswith("["):
+                        r = subprocess.run(["swapoff", dev],
+                            capture_output=True, text=True, timeout=30)
+                    else:
+                        r = subprocess.run(["umount", mp],
+                            capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        unmounted.append(mp if not mp.startswith("[") else f"{dev}(swap)")
+                    else:
+                        err = ((r.stderr or r.stdout) or "").strip().split("\n")[0][:200]
+                        break
+                except Exception as e:
+                    err = str(e)[:200]
+                    break
+            # 残存チェック
+            remain = [mp for _, mp in get_disk_mountpoints(path)]
+            if remain and not err:
+                err = f"解除できませんでした: {', '.join(remain)}"
+            if err:
+                results.append({"path": path, "ok": False, "error": err, "unmounted": unmounted})
+                all_ok = False
+            else:
+                results.append({"path": path, "ok": True, "unmounted": unmounted})
+        self._json({"ok": all_ok, "results": results},
+            200 if all_ok else 400)
 
     def _sse_send(self, text):
         escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
