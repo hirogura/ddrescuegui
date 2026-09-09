@@ -11,7 +11,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.6.4"
+VERSION = "1.6.5"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -1433,6 +1433,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         dest = (data.get("dest") or "").strip()
         source_type = data.get("source_type", "disk")
         dest_type = data.get("dest_type", "disk")
+        # 旧フロントは 'disk'/'file' を送るため 'file' は 'image' とみなす
+        if source_type not in ("disk", "image"):
+            source_type = "image" if source_type == "file" else "disk"
+        if dest_type not in ("disk", "image"):
+            dest_type = "image" if dest_type == "file" else "disk"
         resize = bool(data.get("resize", True))
         if not source:
             self._json({"error": "コピー元を指定してください"}); return
