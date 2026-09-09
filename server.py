@@ -11,7 +11,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -396,6 +396,21 @@ def get_clone_devices():
             out.append(d)
         return out
     return [d for d in devs if d.get("path") != sys_disk]
+
+
+def get_whole_disk_fstype(path):
+    """ディスク全体（/dev/sdX 自体）に載っているファイルシステム種別を返す。無ければ空文字。
+    Clonezilla はディスク全体に FS がある媒体を「パーティション」と判定して
+    ディスク間クローンを拒否するため、事前チェック用（LVM2_member は対象外）"""
+    try:
+        r = subprocess.run(["blkid", "-o", "value", "-s", "TYPE", path],
+            capture_output=True, text=True, timeout=5)
+        fstype = (r.stdout or "").strip().split("\n")[0].strip()
+        if fstype == "LVM2_member":
+            return ""
+        return fstype
+    except Exception:
+        return ""
 
 
 def _split_ocs_image(path):
@@ -1038,6 +1053,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self._json({"error": f"デバイスが見つかりません: {source}"}); return
             if full_devs.get(source, {}).get("has_mount"):
                 self._json({"error": f"{source} はマウント中のパーティションを含むためクローンできません。アンマウントしてから実行してください"}); return
+            # ディスク全体にファイルシステムがある媒体（Live USB のハイブリッド ISO 等）は
+            # Clonezilla が「パーティション」と判定してディスク間クローンを拒否するため事前に案内する
+            src_fs = get_whole_disk_fstype(source)
+            if src_fs:
+                self._json({"error": f"{source} のディスク全体にファイルシステム ({src_fs}) があるため Clonezilla では複製できません"
+                    "（Live USB 等の特殊形式）。このような媒体は「レスキュー」ページの ddrescue でセクタコピーしてください"}); return
         if dest_type == "disk":
             if not WIPE_PATH_RE.match(dest):
                 self._json({"error": f"不正なデバイス指定です: {dest}"}); return

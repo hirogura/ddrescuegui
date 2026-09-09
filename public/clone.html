@@ -64,7 +64,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>Clonezilla 高速クローン</h1>
-    <span class="version">v.1.5.0</span>
+    <span class="version">v.1.5.1</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
@@ -77,7 +77,9 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
         正常なディスクを高速に複製するためのページです。Clonezilla（partclone ベース）により
         <b>使用中のセクタのみ</b>をコピーするため、ddrescue の全セクタ複製より大幅に高速です。<br>
         障害ディスクの復旧には向かないため、その場合は「レスキュー」ページの ddrescue を使ってください。<br>
-        システムドライブは保護のため選択肢に表示されません。
+        システムドライブは保護のため選択肢に表示されません。<br>
+        Live USB 等ディスク全体にファイルシステムがある媒体（ハイブリッド ISO）の複製には対応していません。
+        その場合は「レスキュー」ページの ddrescue でセクタコピーしてください。
     </div>
 
     <div class="install-banner" id="install-banner">
