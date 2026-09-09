@@ -71,7 +71,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>Clonezilla 高速クローン</h1>
-    <span class="version">v.1.6.0</span>
+    <span class="version">v.1.6.1</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
@@ -266,6 +266,11 @@ async function pollInstall() {
 }
 
 async function loadCloneDevices() {
+    // 再構築で選択が外れないよう現在値を保持する
+    const keep = {
+        source: document.getElementById('source').value,
+        dest: document.getElementById('dest').value,
+    };
     try {
         const res = await fetch('/api/clone-devices');
         const data = await res.json();
@@ -278,6 +283,11 @@ async function loadCloneDevices() {
             const sel = document.getElementById(id);
             sel.innerHTML = '<option value="">-- デバイスを選択 --</option>';
             devs.forEach(d => { sel.innerHTML += '<option value="'+d.path+'">'+d.label+'</option>'; });
+            // 保持していた選択が一覧に残っていれば復元する
+            if (keep[id] && Array.from(sel.options).some(o => o.value === keep[id])) {
+                sel.value = keep[id];
+                loadDeviceInfo(id);
+            }
         });
         if (!devs.length) notify('選択可能なディスクがありません', 'error');
     } catch(e) { notify('デバイス一覧の取得に失敗しました', 'error'); }
@@ -521,8 +531,25 @@ function stopProgPoll() {
 async function refreshProgress() {
     try {
         const res = await fetch('/api/clone/progress');
+        if (!res.ok) {
+            // 旧サーバー（v1.6.0 未満）では進捗APIが存在しない
+            stopProgPoll();
+            document.getElementById('prog-label').textContent = '進捗取得不可';
+            document.getElementById('prog-sub').textContent =
+                '進捗表示にはサーバー側の更新が必要です。「レスキューに戻る」→「再起動」で ddrescueGUI を再起動してください。';
+            return;
+        }
         const p = await res.json();
-        if (!p.job) { stopProgPoll(); return; }
+        if (!p.job) {
+            // サーバー再起動等でジョブ情報が無い場合は理由を表示して止める
+            stopProgPoll();
+            if (document.getElementById('prog-pct').textContent === '0.0 %') {
+                document.getElementById('prog-label').textContent = '進捗情報なし';
+                document.getElementById('prog-sub').textContent =
+                    '進捗情報を取得できませんでした（サーバー再起動後の実行分のみ表示できます）。出力ログで確認してください。';
+            }
+            return;
+        }
         renderProgress(p);
         if (!p.running) {
             stopProgPoll();
@@ -565,6 +592,11 @@ async function checkStatus() {
         const res = await fetch('/api/status');
         const data = await res.json();
         updateStatus(data.running);
+        // ヘッダのバージョンはサーバー（稼働中プロセス）の実バージョンで上書きする。
+        // 古いままならサービス再起動が必要と判断できる
+        if (data.version) {
+            document.querySelector('.header .version').textContent = 'v.' + data.version;
+        }
         if (data.running && !logStream && data.log_file) {
             startLogStream(data.log_file.split('/').pop());
         }
