@@ -554,16 +554,29 @@ def get_clone_progress():
     rates = re.findall(r"Rate:\s*([0-9.]+\s*[KMGT]?B/min)", text)
     rate_text = rates[-1] if rates else ""
     # 現在処理中のデバイス（直近の開始行から）
+    # ocs-onthefly のディスク間クローンでは "Starting to back up device (src) to device (dst)"
+    # 形式になるため、旧形式と併せて最終出現位置で判定する
     cur_dev = ""
     saves = re.findall(r"Starting to clone device \(([^)]+)\)", text)
     restores = re.findall(r"Starting to restore image \([^)]*\) to device \(([^)]+)\)", text)
+    backups = re.findall(r"Starting to back up device \(([^)]+)\) to device \(([^)]+)\)", text)
+    runs = re.findall(r"Running:\s+partclone\.\S+.*?-s\s+(\S+)\s+.*?-O\s+(\S+)", text)
     # 時系列順は取れないため、テキスト上の最終出現位置で判定
+    cands = []
     last_save = text.rfind("Starting to clone device (")
+    if last_save >= 0 and saves:
+        cands.append((last_save, saves[-1]))
     last_restore = text.rfind("Starting to restore image (")
-    if last_restore >= 0 and last_restore >= last_save and restores:
-        cur_dev = restores[-1]
-    elif saves:
-        cur_dev = saves[-1]
+    if last_restore >= 0 and restores:
+        cands.append((last_restore, restores[-1]))
+    last_backup = text.rfind("Starting to back up device (")
+    if last_backup >= 0 and backups:
+        cands.append((last_backup, f"{backups[-1][0]} → {backups[-1][1]}"))
+    last_run = text.rfind("Running: partclone.")
+    if last_run >= 0 and runs:
+        cands.append((last_run, f"{runs[-1][0]} → {runs[-1][1]}"))
+    if cands:
+        cur_dev = sorted(cands, key=lambda x: x[0])[-1][1]
     total_ops = job.get("total_ops") or (done_ops + 1)
     if total_ops <= 0:
         total_ops = done_ops + 1
@@ -608,6 +621,7 @@ def get_clone_progress():
         eta_text = "完了"
     return {"running": running, "returncode": rc, "failed": failed,
         "status": status, "adopted": adopted,
+        "job": job,
         "overall_percent": overall, "current_percent": round(cur_frac * 100.0, 1),
         "done_ops": done_ops, "total_ops": total_ops,
         "current_device": cur_dev, "op_remaining": op_remaining,
