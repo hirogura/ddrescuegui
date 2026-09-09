@@ -66,7 +66,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f
 <body>
 <div class="header">
     <h1>ディスク完全消去</h1>
-    <span class="version">v.1.6.2</span>
+    <span class="version">v.1.6.3</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
         <button class="btn-header" onclick="location.reload()">リフレッシュ</button>
@@ -116,6 +116,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f
 <script>
 let devices = [];
 let pollTimer = null;
+let seenJobId = null;
 
 function notify(msg, type) {
     const el = document.createElement('div');
@@ -251,43 +252,86 @@ function setBadge(running) {
     else { b.textContent = '待機中'; b.className = 'status-badge status-idle'; }
 }
 
-async function refreshStatus() {
+function renderJob(job) {
+    const prog = document.getElementById('prog');
+    prog.style.display = 'block';
+    prog.innerHTML = '';
+    job.targets.forEach(t => {
+        const item = document.createElement('div');
+        item.className = 'prog-item' + (t.status === 'done' ? ' done' : t.status === 'error' ? ' error' : '');
+        const pct = t.percent != null ? Number(t.percent).toFixed(1) : '0.0';
+        let sub = esc(t.method_detail || '') + ' ｜ ' + esc(t.message || '');
+        if (t.status === 'running' && t.is_ssd) {
+            sub += ' ｜ 経過表示のみ（進捗取得不可）';
+        } else if (t.status === 'running') {
+            sub += ' ｜ ' + fmtEta(t.eta_sec) + (t.speed_bps ? ' ｜ ' + fmtSpeed(t.speed_bps) : '');
+            if (t.pass_total > 1) sub += ' ｜ パス ' + t.pass_current + '/' + t.pass_total;
+        }
+        item.innerHTML =
+            '<div class="prog-head"><span><b>' + esc(t.path) + '</b> [' + esc(t.status) + ']</span><span>' + pct + ' %</span></div>' +
+            '<div class="prog-bar"><div class="prog-fill" style="width:' + pct + '%"></div></div>' +
+            '<div class="prog-sub">' + sub + '</div>';
+        prog.appendChild(item);
+    });
+}
+
+async function refreshStatus(silent) {
     try {
         const res = await fetch('/api/wipe/status');
         const data = await res.json();
         setBadge(data.running);
-        const prog = document.getElementById('prog');
-        if (!data.job) return;
-        prog.style.display = 'block';
-        prog.innerHTML = '';
-        data.job.targets.forEach(t => {
-            const item = document.createElement('div');
-            item.className = 'prog-item' + (t.status === 'done' ? ' done' : t.status === 'error' ? ' error' : '');
-            const pct = t.percent != null ? Number(t.percent).toFixed(1) : '0.0';
-            let sub = esc(t.method_detail || '') + ' ｜ ' + esc(t.message || '');
-            if (t.status === 'running' && t.is_ssd) {
-                sub += ' ｜ 経過表示のみ（進捗取得不可）';
-            } else if (t.status === 'running') {
-                sub += ' ｜ ' + fmtEta(t.eta_sec) + (t.speed_bps ? ' ｜ ' + fmtSpeed(t.speed_bps) : '');
-                if (t.pass_total > 1) sub += ' ｜ パス ' + t.pass_current + '/' + t.pass_total;
-            }
-            item.innerHTML =
-                '<div class="prog-head"><span><b>' + esc(t.path) + '</b> [' + esc(t.status) + ']</span><span>' + pct + ' %</span></div>' +
-                '<div class="prog-bar"><div class="prog-fill" style="width:' + pct + '%"></div></div>' +
-                '<div class="prog-sub">' + sub + '</div>';
-            prog.appendChild(item);
-        });
+        if (!data.job) return false;
+        seenJobId = data.job.id;
+        renderJob(data.job);
         if (!data.running) {
             clearInterval(pollTimer); pollTimer = null;
             document.getElementById('btn-exec').disabled = false;
             document.getElementById('btn-stop').disabled = true;
-            const allDone = data.job.targets.every(t => t.status === 'done');
-            notify(allDone ? 'すべての消去が完了しました' : 'ジョブが終了しました（詳細は各項目を確認）', allDone ? 'success' : 'error');
+            if (!silent) {
+                const allDone = data.job.targets.every(t => t.status === 'done');
+                notify(allDone ? 'すべての消去が完了しました' : 'ジョブが終了しました（詳細は各項目を確認）', allDone ? 'success' : 'error');
+            }
+        }
+        return data.running;
+    } catch (e) { return null; }
+}
+
+// 他端末で開始・終了したジョブを検出して同一表示にするための監視
+async function watchStatus() {
+    if (pollTimer) return;  // 自端末で実行・追跡中は何もしない
+    try {
+        const res = await fetch('/api/wipe/status');
+        const data = await res.json();
+        if (!data.job) return;
+        if (data.running) {
+            // 他端末で開始された実行中ジョブに接続する
+            seenJobId = data.job.id;
+            setBadge(true);
+            document.getElementById('btn-exec').disabled = true;
+            document.getElementById('btn-stop').disabled = false;
+            notify('実行中の消去ジョブに接続しました', 'success');
+            startPoll();
+        } else if (data.job.id !== seenJobId) {
+            // 他端末で終了したジョブの最終状態を表示する
+            seenJobId = data.job.id;
+            setBadge(false);
+            renderJob(data.job);
         }
     } catch (e) {}
 }
 
-loadDevices();
+async function init() {
+    await loadDevices();
+    // 開いた時点で実行中・終了済みのジョブがあれば同一表示にする
+    const running = await refreshStatus(true);
+    if (running) {
+        document.getElementById('btn-exec').disabled = true;
+        document.getElementById('btn-stop').disabled = false;
+        startPoll();
+    }
+    setInterval(watchStatus, 5000);
+}
+init();
 </script>
 </body>
 </html>
