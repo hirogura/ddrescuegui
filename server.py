@@ -11,7 +11,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -507,7 +507,11 @@ def get_clone_progress():
     job = _load_clone_job()
     adopted = False
     if running_process is not None and running_process.poll() is None:
-        running, rc = True, None
+        # 自管理プロセスが別ジョブ（レスキュー等）の場合は実行中としない
+        if job and job.get("pid") == running_process.pid:
+            running, rc = True, None
+        else:
+            running, rc = False, None
     elif job and job.get("pid") and _pid_is_clone(job.get("pid")):
         # サービス再起動後に取り残されたプロセスを引き継いで追跡する
         running, rc, adopted = True, None, True
@@ -628,6 +632,142 @@ def get_clone_progress():
         "rate": rate_text, "phase": phase,
         "eta_text": eta_text, "elapsed_sec": elapsed,
         "parts": job.get("parts", []), "log_file": job.get("log_file", "")}
+
+
+# ---- レスキュー（ddrescue）進捗表示用ヘルパー ----
+# クローン／消去ページと同じ方式：ログ末尾のパース＋ジョブ情報の返却
+rescue_job = None
+rescue_lock = threading.Lock()
+RESCUE_JOB_FILE = os.path.join(LOG_DIR, ".rescue_job.json")
+
+
+def _save_rescue_job(job):
+    """レスキュージョブ情報をメモリ＋ファイルに保存する"""
+    global rescue_job
+    with rescue_lock:
+        rescue_job = job
+    try:
+        with open(RESCUE_JOB_FILE, "w") as f:
+            json.dump(job, f)
+    except Exception:
+        pass
+
+
+def _load_rescue_job():
+    """メモリ優先、無ければファイルからレスキュージョブ情報を復元する"""
+    with rescue_lock:
+        if rescue_job is not None:
+            return dict(rescue_job)
+    try:
+        if os.path.exists(RESCUE_JOB_FILE):
+            with open(RESCUE_JOB_FILE, "r") as f:
+                job = json.load(f)
+            if isinstance(job, dict) and job.get("log_path"):
+                return job
+    except Exception:
+        pass
+    return None
+
+
+def _pid_is_rescue(pid):
+    """指定 pid が ddrescue プロセスか確認する。PID 再利用の誤認防止用"""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            cmd = f.read().decode(errors="replace").lower()
+        return "ddrescue" in cmd
+    except Exception:
+        # cmdline が読めない＝権限等の例外時は生存のみで判断する
+        return True
+
+
+def get_rescue_progress():
+    """実行中レスキューの進捗をログ解析で推定する。ddrescue の出力形式を利用（参考値）"""
+    job = _load_rescue_job()
+    adopted = False
+    if running_process is not None and running_process.poll() is None:
+        # 自管理プロセスが別ジョブ（クローン等）の場合は実行中としない
+        if job and job.get("pid") == running_process.pid:
+            running, rc = True, None
+        else:
+            running, rc = False, None
+    elif job and job.get("pid") and _pid_is_rescue(job.get("pid")):
+        # サービス再起動後に取り残されたプロセスを引き継いで追跡する
+        running, rc, adopted = True, None, True
+    else:
+        running = False
+        rc = None if running_process is None else running_process.poll()
+    if not job:
+        return {"running": running, "job": None}
+    log_file = job.get("log_path", "")
+    text = ""
+    try:
+        if log_file and os.path.exists(log_file):
+            with open(log_file, "r", errors="replace") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                text = f.read()
+    except Exception:
+        pass
+    # 制御文字・ANSIエスケープを除去し、\r を改行扱いにする
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r", "\n")
+    # 救出率（%）。直近の値を採用
+    pcts = re.findall(r"pct rescued:\s*([\d.]+)\s*%", text)
+    percent = 0.0
+    if pcts:
+        try:
+            percent = min(100.0, max(0.0, float(pcts[-1])))
+        except Exception:
+            percent = 0.0
+    # 救出量・速度・残り時間等の参考情報（直近の値を採用）
+    rescued = re.findall(r"^\s*rescued:\s*([0-9.]+\s*[KMGT]?B)", text, re.M)
+    rescued_text = rescued[-1].strip() if rescued else ""
+    cur_rates = re.findall(r"current rate:\s*([0-9.]+\s*\S+/s)", text)
+    cur_rate = cur_rates[-1].strip() if cur_rates else ""
+    avg_rates = re.findall(r"average rate:\s*([0-9.]+\s*\S+/s)", text)
+    avg_rate = avg_rates[-1].strip() if avg_rates else ""
+    rems = re.findall(r"remaining time:\s*([^\s,]+)", text)
+    remaining = rems[-1].strip() if rems else ""
+    runs = re.findall(r"run time:\s*([^\s,]+)", text)
+    run_time = runs[-1].strip() if runs else ""
+    errs = re.findall(r"read errors:\s*(\d+)", text)
+    read_errors = errs[-1] if errs else "0"
+    bads = re.findall(r"bad areas:\s*(\d+)", text)
+    bad_areas = bads[-1] if bads else "0"
+    # 現在のフェーズ（序盤の無出力対策で直近の作業行を抜粋）
+    phases = re.findall(
+        r"((?:Copying|Scraping|Trimming|Retrying|Filling|Generating|Verifying)[^\n]*|Finished[^\n]*)",
+        text)
+    phase = phases[-1].strip()[:110] if phases else ""
+    # 状態判定（フロント表示用。中断は SIGTERM/SIGKILL 系の負の終了コードで区別）
+    if running:
+        status = "running"
+    elif rc == 0:
+        status = "done"
+        percent = 100.0
+    elif rc is not None and rc < 0:
+        status = "stopped"
+    elif rc is None:
+        status = "unknown"
+    else:
+        status = "error"
+    elapsed = int(time.time() - job.get("started_at", time.time()))
+    return {"running": running, "returncode": rc,
+        "status": status, "adopted": adopted,
+        "job": job,
+        "percent": round(percent, 2),
+        "rescued": rescued_text, "current_rate": cur_rate,
+        "average_rate": avg_rate, "remaining": remaining,
+        "run_time": run_time, "read_errors": read_errors,
+        "bad_areas": bad_areas, "phase": phase,
+        "elapsed_sec": elapsed, "log_file": job.get("log_file", "")}
 
 
 def _split_ocs_image(path):
@@ -987,6 +1127,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json({"system_disk": sys_disk, "devices": get_clone_devices()})
         elif p.path == "/api/clone/progress":
             self._json(get_clone_progress())
+        elif p.path == "/api/rescue/progress":
+            self._json(get_rescue_progress())
         else:
             super().do_GET()
 
@@ -1069,6 +1211,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             log_f.flush()
             running_process = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
             log_f.close()
+            _save_rescue_job({"source": source, "dest": dest,
+                "started_at": time.time(), "log_file": log_name, "log_path": current_log_file,
+                "mapfile": mapfile_path, "pid": running_process.pid})
             self._json({"ok": True, "log_file": log_name, "pid": running_process.pid})
         except Exception as e:
             self._json({"error": str(e)})

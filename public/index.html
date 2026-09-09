@@ -51,6 +51,13 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 .status-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:0.8em;font-weight:bold}
 .status-running{background:rgba(34,197,94,0.2);color:#22c55e}
 .status-idle{background:rgba(100,116,139,0.2);color:#94a3b8}
+.prog{margin-top:6px}
+.prog-head{display:flex;justify-content:space-between;font-size:0.9em;margin-bottom:6px;gap:8px;flex-wrap:wrap}
+.prog-bar{height:14px;background:#334155;border-radius:7px;overflow:hidden}
+.prog-fill{height:100%;background:#2563eb;border-radius:7px;transition:width 0.8s;min-width:0}
+.prog.done .prog-fill{background:#16a34a}
+.prog.error .prog-fill{background:#dc2626}
+.prog-sub{font-size:0.82em;color:#94a3b8;margin-top:6px;line-height:1.7}
 .tabs{display:flex;gap:0;border-bottom:2px solid #334155;margin-bottom:16px}
 .tabs button{padding:10px 20px;background:none;border:none;color:#64748b;cursor:pointer;font-size:0.95em;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all 0.2s}
 .tabs button.active{color:#38bdf8;border-bottom-color:#38bdf8}
@@ -73,7 +80,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>ddrescueGUI</h1>
-    <span id="version" class="version">v.1.6.3</span>
+    <span id="version" class="version">v.1.6.4</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
         <button class="btn-header" id="btn-clone" onclick="openClonezilla()" style="background:#166534">Clonezilla</button>
@@ -197,6 +204,15 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
                     <button class="btn btn-secondary" onclick="copyCmd()" style="padding:6px 14px;font-size:0.85em">コピー</button>
                 </div>
                 <pre id="cmd-text"></pre>
+            </div>
+        </div>
+
+        <div class="card" id="prog-card" style="display:none">
+            <h2>進捗（参考値）</h2>
+            <div class="prog" id="prog">
+                <div class="prog-head"><span id="prog-label">準備中...</span><span id="prog-pct">0.0 %</span></div>
+                <div class="prog-bar"><div class="prog-fill" id="prog-fill" style="width:0%"></div></div>
+                <div class="prog-sub" id="prog-sub"></div>
             </div>
         </div>
 
@@ -426,6 +442,7 @@ async function startRescue() {
         document.getElementById('btn-force-stop').disabled = false;
         updateStatus(true);
         startLogStream(data.log_file);
+        startProgPoll();
     } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
 }
 
@@ -434,7 +451,9 @@ async function stopRescue() {
     try {
         await fetch('/api/stop', {method: 'POST'});
         notify('中断しました', 'success');
+        suppressDoneNotify = true;
         updateStatus(false);
+        refreshProgress();
     } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
 }
 
@@ -443,7 +462,9 @@ async function forceStopRescue() {
     try {
         await fetch('/api/force-stop', {method: 'POST'});
         notify('強制停止しました', 'success');
+        suppressDoneNotify = true;
         updateStatus(false);
+        refreshProgress();
     } catch(e) { notify('通信エラー: ' + e.message, 'error'); }
 }
 
@@ -596,6 +617,94 @@ function startLogStream(logName) {
     logStream.onerror = function() { logStream.close(); logStream = null; checkStatus(); };
 }
 
+let progTimer = null;
+let progDoneNotified = false;
+let suppressDoneNotify = false;
+
+function fmtElapsed(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    if (h > 0) return h + '時間' + m + '分';
+    if (m > 0) return m + '分' + s + '秒';
+    return s + '秒';
+}
+
+function startProgPoll() {
+    progDoneNotified = false;
+    suppressDoneNotify = false;
+    document.getElementById('prog-card').style.display = 'block';
+    document.getElementById('prog').classList.remove('done', 'error');
+    document.getElementById('prog-fill').style.width = '0%';
+    document.getElementById('prog-pct').textContent = '0.0 %';
+    document.getElementById('prog-label').textContent = '準備中...';
+    document.getElementById('prog-sub').textContent = '';
+    if (progTimer) clearInterval(progTimer);
+    progTimer = setInterval(refreshProgress, 2000);
+    refreshProgress();
+}
+
+function stopProgPoll() {
+    if (progTimer) { clearInterval(progTimer); progTimer = null; }
+}
+
+async function refreshProgress() {
+    try {
+        const res = await fetch('/api/rescue/progress');
+        if (!res.ok) {
+            // 旧サーバーでは進捗APIが存在しない
+            stopProgPoll();
+            document.getElementById('prog-card').style.display = 'none';
+            return;
+        }
+        const p = await res.json();
+        if (!p.job) {
+            stopProgPoll();
+            if (document.getElementById('prog-pct').textContent === '0.0 %') {
+                document.getElementById('prog-card').style.display = 'none';
+            }
+            return;
+        }
+        renderProgress(p);
+        if (!p.running) {
+            stopProgPoll();
+            if (!progDoneNotified && !suppressDoneNotify) {
+                progDoneNotified = true;
+                if (p.status === 'done') notify('レスキューが完了しました', 'success');
+                else if (p.status === 'stopped') notify('レスキューは中断されました', 'error');
+                else if (p.status === 'error') notify('レスキューが異常終了しました（出力ログを確認してください）', 'error');
+            }
+        }
+    } catch(e) {}
+}
+
+function renderProgress(p) {
+    const pct = Math.min(100, Number(p.percent || 0));
+    document.getElementById('prog-pct').textContent = pct.toFixed(1) + ' %';
+    document.getElementById('prog-fill').style.width = pct + '%';
+    const box = document.getElementById('prog');
+    box.classList.remove('done', 'error');
+    let label = '実行中... ' + pct.toFixed(1) + ' %';
+    if (p.adopted && p.running) label += '（サーバー再起動後に引き継ぎ）';
+    if (!p.running) {
+        if (p.status === 'done') { label = '完了'; box.classList.add('done'); }
+        else if (p.status === 'stopped') { label = '中断'; box.classList.add('error'); }
+        else if (p.status === 'unknown') { label = '終了（結果不明）'; box.classList.add('error'); }
+        else { label = '異常終了'; box.classList.add('error'); }
+    }
+    document.getElementById('prog-label').textContent = label;
+    let sub = '';
+    if (p.rescued) sub += '救出済み ' + p.rescued;
+    if (p.current_rate) sub += (sub ? ' ｜ ' : '') + '現在 ' + p.current_rate;
+    if (p.average_rate) sub += '（平均 ' + p.average_rate + '）';
+    if (p.remaining) sub += (sub ? ' ｜ ' : '') + '残り ' + p.remaining;
+    if (p.run_time) sub += (sub ? ' ｜ ' : '') + '実行 ' + p.run_time;
+    sub += (sub ? ' ｜ ' : '') + '経過 ' + fmtElapsed(p.elapsed_sec);
+    sub += ' ｜ 読取エラー ' + (p.read_errors || '0') + ' / 不良箇所 ' + (p.bad_areas || '0');
+    if (p.phase) sub += '\n状況: ' + p.phase;
+    sub += '\n※ ddrescue 出力の参考表示です。正確な状況は出力ログで確認してください。';
+    document.getElementById('prog-sub').textContent = sub;
+}
+
 async function checkStatus() {
     try {
         const res = await fetch('/api/status');
@@ -604,6 +713,17 @@ async function checkStatus() {
         if (data.version) document.getElementById('version').textContent = 'v.' + data.version;
         if (data.running && !logStream && data.log_file) {
             startLogStream(data.log_file.split('/').pop());
+        }
+        // 別タブ開始・リロード後に実行中だった場合は進捗ポーリングも復帰させる
+        if (data.running && !progTimer) {
+            try {
+                const pr = await (await fetch('/api/rescue/progress')).json();
+                if (pr.job && pr.running) {
+                    document.getElementById('prog-card').style.display = 'block';
+                    progTimer = setInterval(refreshProgress, 2000);
+                    refreshProgress();
+                }
+            } catch(e2) {}
         }
         if (!data.running && currentStreamLog) {
             const output = document.getElementById('log-output');
