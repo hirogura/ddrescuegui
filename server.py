@@ -1284,6 +1284,64 @@ def _fmt_bytes(n):
     return f"{n} B"
 
 
+def _parse_rsync_size(s):
+    """rsync --info=progress2（-hあり/なし）の転送量表記をバイト数に変換する（参考値）"""
+    try:
+        t = (s or "").strip().replace(",", "").upper()
+        if not t:
+            return 0
+        mult = 1
+        if t.endswith("B"):
+            t = t[:-1].strip()
+        if t and t[-1] in ("K", "M", "G", "T"):
+            mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}[t[-1]]
+            t = t[:-1].strip()
+        return int(float(t) * mult)
+    except Exception:
+        return 0
+
+
+def _estimate_rsync_total(src_base, items, recursive=True):
+    """コピー開始前に転送対象の合計バイト数・ファイル数を概算する（参考値）"""
+    total_bytes = 0
+    total_files = 0
+    try:
+        for name in items or []:
+            full = os.path.join(src_base, name)
+            try:
+                if os.path.islink(full) or os.path.isfile(full):
+                    try:
+                        total_bytes += os.lstat(full).st_size
+                    except Exception:
+                        pass
+                    total_files += 1
+                elif os.path.isdir(full) and not os.path.islink(full):
+                    if not recursive:
+                        total_files += 1
+                        continue
+                    for root, _dirs, files in os.walk(full, followlinks=False):
+                        for fn in files:
+                            fp = os.path.join(root, fn)
+                            try:
+                                if os.path.islink(fp):
+                                    total_files += 1
+                                    continue
+                                total_bytes += os.lstat(fp).st_size
+                                total_files += 1
+                            except Exception:
+                                continue
+                            # 巨大なツリーで開始が遅くならないよう上限を設ける
+                            if total_files > 200000:
+                                return total_bytes, total_files
+                else:
+                    total_files += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return total_bytes, total_files
+
+
 def get_rsync_status():
     """rsync コマンドの導入状態を返す"""
     has_rsync = shutil.which("rsync") is not None
@@ -1337,7 +1395,7 @@ def _run_rsync_install():
 
 
 def get_rsync_progress():
-    """実行中 rsync の進捗をログ解析で推定する（--info=progress2 の出力利用）"""
+    """実行中 rsync の進捗をログ解析＋事前概算で推定する（--info=progress2 の出力利用。参考値）"""
     job = _load_rsync_job()
     adopted = False
     if running_process is not None and running_process.poll() is None:
@@ -1364,34 +1422,70 @@ def get_rsync_progress():
     except Exception:
         pass
     text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r", "\n")
-    # --info=progress2 の「12,345  45% ... (xfr#12, to-chk=3/10)」形式から直近値を採用
-    pcts = re.findall(r"([\d,]+)\s+(\d{1,3})%\s+[\d.]+\s*\S*/s", text)
+    # --info=progress2 の「5.24M  33%  621.09MB/s (xfr#1, to-chk=2/4)」形式から直近値を採用。
+    # -h 付きのため転送量は「32.77K」「12,345」の両形式を取り得る
+    prog_rows = re.findall(
+        r"([0-9][\d,]*\.?\d*\s*[KMGT]?B?)\s+(\d{1,3})%\s+([\d.]+\s*[KMGT]?B/s)",
+        text, re.I)
     percent = 0.0
     speed = ""
-    if pcts:
+    transferred_str = ""
+    transferred_bytes = 0
+    if prog_rows:
         try:
-            percent = min(100.0, max(0.0, float(pcts[-1][1])))
+            transferred_str = prog_rows[-1][0].strip()
+            percent = min(100.0, max(0.0, float(prog_rows[-1][1])))
+            speed = prog_rows[-1][2].strip()
+            transferred_bytes = _parse_rsync_size(transferred_str)
         except Exception:
             percent = 0.0
     else:
-        bare = re.findall(r"(?:^|\n)\s*[\d,]+\s+(\d{1,3})%", text)
+        # 旧形式・桁区切りなし等のフォールバック（%単独行も拾う）
+        bare = re.findall(r"(?:^|\n)\s*[0-9][\d,]*\.?\d*\s*[KMGT]?B?\s+(\d{1,3})%", text, re.I)
         if bare:
             try:
                 percent = min(100.0, max(0.0, float(bare[-1])))
             except Exception:
                 pass
-    speeds = re.findall(r"(\d[\d.]*\s*[KMGT]?B/s)", text)
+    speeds = re.findall(r"(\d[\d.]*\s*[KMGT]?B/s)", text, re.I)
     if speeds:
-        speed = speeds[-1]
+        speed = speeds[-1].strip()
     xfrs = re.findall(r"xfr#(\d+)", text)
     xfr = xfrs[-1] if xfrs else ""
     tochs = re.findall(r"to-chk=(\d+)/(\d+)", text)
     toch = f"{tochs[-1][0]}/{tochs[-1][1]}" if tochs else ""
+    # ファイル数ベースの参考進捗（to-chk=残り/全体。残りが0に近づくほど完了）
+    file_percent = None
+    try:
+        if tochs:
+            remain, whole = int(tochs[-1][0]), int(tochs[-1][1])
+            if whole > 0 and 0 <= remain <= whole:
+                file_percent = (whole - remain) / whole * 100.0
+    except Exception:
+        file_percent = None
+    # 容量ベースの参考進捗（事前概算の合計に対する転送量の割合）
+    bytes_percent = None
+    total_bytes = int(job.get("total_bytes") or 0)
+    try:
+        if total_bytes > 0 and transferred_bytes > 0:
+            bytes_percent = min(100.0, transferred_bytes / total_bytes * 100.0)
+    except Exception:
+        bytes_percent = None
+    # 進捗率の決定：progress2 の % を優先し、未出力の序盤はファイル数・容量ベースで補完する。
+    # progress2 の % は全体容量基準のため、0% のまま停滞しがちな序盤のみ補完する
+    basis = "progress2"
+    if percent <= 0:
+        if file_percent is not None and file_percent > 0:
+            percent = file_percent
+            basis = "file-count"
+        elif bytes_percent is not None and bytes_percent > 0:
+            percent = bytes_percent
+            basis = "bytes"
     failed = ("rsync error" in text) or ("rsync: " in text and "failed" in text.lower())
     # 現在のフェーズ（直近のファイル行。進捗行・空行は除外）
     phase = ""
     try:
-        noise_re = re.compile(r"^\s*[\d,]+\s+\d{1,3}%|xfr#|to-chk=|^sending|^sent |^total size|^receiving|^\s*$")
+        noise_re = re.compile(r"^\s*[\d,]+\s+\d{1,3}%|^\s*[0-9][\d,.]*\s*[KMGT]?B?\s+\d{1,3}%|xfr#|to-chk=|^sending|^sent |^total size|^receiving|^\s*$", re.I)
         cands = [ln.strip()[:110] for ln in text.split("\n")
             if ln.strip() and not noise_re.search(ln.strip())]
         if cands:
@@ -1410,12 +1504,30 @@ def get_rsync_progress():
     else:
         status = "error"
     elapsed = int(time.time() - job.get("started_at", time.time()))
+    # 残り時間の目安（参考値）。進捗1%以上で経過時間から線形推定する
+    eta_text = "残り時間: 計算中"
+    try:
+        if running and percent >= 1.0 and percent < 100.0:
+            eta_text = _fmt_eta(elapsed * (100.0 - percent) / percent)
+        elif running and basis == "file-count" and percent >= 1.0:
+            eta_text = _fmt_eta(elapsed * (100.0 - percent) / percent) + "（ファイル数から推定）"
+    except Exception:
+        pass
+    if status == "done":
+        eta_text = "完了"
+    total_h = _fmt_bytes(total_bytes) if total_bytes > 0 else ""
+    transferred_h = _fmt_bytes(transferred_bytes) if transferred_bytes > 0 else (transferred_str or "")
     return {"running": running, "returncode": rc,
         "status": status, "adopted": adopted,
         "job": job,
         "percent": round(percent, 1),
+        "percent_basis": basis,
         "speed": speed, "transferred_files": xfr, "to_check": toch,
+        "transferred_bytes": transferred_bytes, "transferred_h": transferred_h,
+        "total_bytes": total_bytes, "total_h": total_h,
+        "total_files": int(job.get("total_files") or 0),
         "phase": phase, "failed": failed,
+        "eta_text": eta_text,
         "elapsed_sec": elapsed, "log_file": job.get("log_file", "")}
 
 
@@ -2437,6 +2549,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self._json({"error": f"コピー先がフォルダではありません: {dst_base_in}"}); return
         except Exception as e:
             self._json({"error": f"コピー先フォルダを作成できません: {e}"}); return
+        # 進捗推定の基準となる合計容量・ファイル数を概算する（参考値。失敗してもコピーは続行）
+        recursive = bool(opts.get("recursive", True))
+        try:
+            total_bytes, total_files = _estimate_rsync_total(src_base, clean_items, recursive)
+        except Exception:
+            total_bytes, total_files = 0, 0
         # コマンド組み立て（進捗表示・詳細出力は常に有効。-r/-t/-u のみ切替）
         cmd = ["stdbuf", "-o0", "-e0", "rsync", "-v", "-h", "--info=progress2", "--stats"]
         if opts.get("recursive", True):
@@ -2455,17 +2573,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             log_f.write(f"=== rsync started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
             log_f.write(f"Command: {' '.join(shlex.quote(c) for c in cmd)}\n")
             log_f.write(f"src_base={src_base} dst_base={dst_real} items={len(clean_items)} "
-                f"recursive={bool(opts.get('recursive', True))} "
+                f"recursive={recursive} "
                 f"timestamps={bool(opts.get('timestamps', True))} "
-                f"update={bool(opts.get('update', True))} created_dst={created}\n\n")
+                f"update={bool(opts.get('update', True))} created_dst={created} "
+                f"total_bytes={total_bytes} ({_fmt_bytes(total_bytes)}) total_files={total_files}\n\n")
             log_f.flush()
             running_process = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
             log_f.close()
             _save_rsync_job({"src_base": src_base, "dst_base": dst_real,
                 "items": clean_items, "options": {
-                    "recursive": bool(opts.get("recursive", True)),
+                    "recursive": recursive,
                     "timestamps": bool(opts.get("timestamps", True)),
                     "update": bool(opts.get("update", True))},
+                "total_bytes": total_bytes, "total_files": total_files,
                 "started_at": time.time(), "log_file": log_name, "log_path": current_log_file,
                 "pid": running_process.pid})
             self._json({"ok": True, "log_file": log_name, "pid": running_process.pid,

@@ -808,6 +808,9 @@ function renderProgress(p) {
     const box = document.getElementById('prog');
     box.classList.remove('done', 'error');
     let label = '実行中... ' + pct.toFixed(1) + ' %';
+    if (p.percent_basis && p.percent_basis !== 'progress2' && p.running) {
+        label += p.percent_basis === 'file-count' ? '（ファイル数から推定）' : '（容量から推定）';
+    }
     if (p.adopted && p.running) label += '（サーバー再起動後に引き継ぎ）';
     if (!p.running) {
         if (p.status === 'done') { label = '完了'; box.classList.add('done'); }
@@ -817,10 +820,15 @@ function renderProgress(p) {
     }
     document.getElementById('prog-label').textContent = label;
     let sub = '';
-    if (p.speed) sub += '速度 ' + p.speed;
+    if (p.transferred_h && p.total_h) sub += p.transferred_h + ' / ' + p.total_h;
+    else if (p.total_h) sub += '合計 ' + p.total_h;
+    else if (p.transferred_h) sub += '転送済み ' + p.transferred_h;
+    if (p.speed) sub += (sub ? ' ｜ ' : '') + '速度 ' + p.speed;
     if (p.to_check) sub += (sub ? ' ｜ ' : '') + '残り ' + p.to_check;
     if (p.transferred_files) sub += (sub ? ' ｜ ' : '') + '転送ファイル数 ' + p.transferred_files;
+    if (p.total_files) sub += (sub ? ' ｜ ' : '') + '対象ファイル数 約' + p.total_files;
     sub += (sub ? ' ｜ ' : '') + '経過 ' + fmtElapsed(p.elapsed_sec);
+    if (p.eta_text) sub += ' ｜ ' + p.eta_text + '（参考値）';
     if (p.job && p.job.items) sub += ' ｜ 選択 ' + p.job.items.length + ' 件';
     if (p.phase) sub += '\n状況: ' + p.phase;
     document.getElementById('prog-sub').textContent = sub;
