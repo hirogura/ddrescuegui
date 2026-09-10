@@ -6,7 +6,7 @@
 
 - 動作環境: Debian / Ubuntu / CachyOS（Arch 系含む）（systemd を使用）
 - デフォルトポート: **3327**
-- 使用ツール: `ddrescue`（Debian では `gddrescue`）, `smartmontools`, `fdisk` / `lsblk`（Arch 系では `util-linux`）, `file`, `git`, `clonezilla`, `partclone`
+- 使用ツール: `ddrescue`（Debian では `gddrescue`）, `smartmontools`, `fdisk` / `lsblk`（Arch 系では `util-linux`）, `file`, `git`, `clonezilla`, `partclone`, `rsync`
 
 ## インストール
 
@@ -32,8 +32,8 @@ OS を自動判定し、Debian / Ubuntu 系では `apt-get`、CachyOS / Arch 系
 
 | ディストリビューション | パッケージマネージャ | 導入パッケージ |
 | --- | --- | --- |
-| Debian / Ubuntu | `apt-get` | `python3`, `gddrescue`, `smartmontools`, `fdisk`, `git`, `clonezilla`, `partclone` |
-| CachyOS / Arch 系 | `pacman` | `python`, `ddrescue`, `smartmontools`, `util-linux`, `file`, `git`, `clonezilla`, `partclone` |
+| Debian / Ubuntu | `apt-get` | `python3`, `gddrescue`, `smartmontools`, `fdisk`, `git`, `clonezilla`, `partclone`, `rsync` |
+| CachyOS / Arch 系 | `pacman` | `python`, `ddrescue`, `smartmontools`, `util-linux`, `file`, `git`, `clonezilla`, `partclone`, `rsync` |
 
 Tailscale が導入済みの環境では、インストーラが自動で Tailscale Serve を設定し、
 Tailnet 内のみ HTTPS（`https://<マシン名>.<tailnet>.ts.net:3327`）で公開します。
@@ -78,10 +78,11 @@ sudo journalctl -u ddrescuegui -f   # ログ表示
 ```
  /opt/ddrescuegui/
  ├── server.py            # Web サーバー本体
- ├── public/index.html    # レスキュー UI
- ├── public/clone.html    # Clonezilla 高速クローン UI
- ├── public/smart.html    # S.M.A.R.T.情報 UI
- ├── public/wipe.html     # ディスク完全消去 UI
+  ├── public/index.html    # レスキュー UI
+  ├── public/clone.html    # Clonezilla 高速クローン UI
+  ├── public/rsync.html    # rsync ファイルコピー UI
+  ├── public/smart.html    # S.M.A.R.T.情報 UI
+  ├── public/wipe.html     # ディスク完全消去 UI
  ├── logs/                # 実行ログ・マップファイル（自動生成）
  └── install.sh           # インストーラ
 ```
@@ -90,6 +91,7 @@ sudo journalctl -u ddrescuegui -f   # ログ表示
 
 - レスキュー（ddrescue による全セクタ複製・障害ディスク対応）
 - Clonezilla 高速クローン（正常ディスク向け・使用中セクタのみ複製。システムドライブは対象外。進捗グラフ＋残り時間表示、マウント時はアンマウント確認あり）
+- rsync ファイルコピー（ドライブ／ddrescueの.imgイメージからマウントし、フォルダ・ファイルを選択してコピー。-r/-t/-u 切替、コピー先フォルダ自動作成）
 - ディスク完全消去（ゼロ／乱数上書き、SSD は Sanitize 相当を自動選択）
 - S.M.A.R.T.情報表示
 

@@ -2,6 +2,7 @@
 import http.server
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -11,7 +12,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.6.5"
+VERSION = "1.7.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -770,6 +771,654 @@ def get_rescue_progress():
         "elapsed_sec": elapsed, "log_file": job.get("log_file", "")}
 
 
+# ---- rsync ファイルコピー用ヘルパー ----
+# 物理パーティションまたは ddrescue の .img イメージからマウントし、
+# 選択したフォルダ・ファイルを rsync でコピーする
+rsync_job = None
+rsync_lock = threading.Lock()
+RSYNC_JOB_FILE = os.path.join(LOG_DIR, ".rsync_job.json")
+RSYNC_MOUNT_FILE = os.path.join(LOG_DIR, ".rsync_mounts.json")
+RSYNC_MOUNT_BASE = "/mnt/ddrescuegui-rsync"
+# マウント対象として許可するデバイス名（ホールディスク＋パーティション。loop/dm等は不可）
+RSYNC_DEV_RE = re.compile(r"^/dev/(sd[a-z]+\d*|hd[a-z]+\d*|vd[a-z]+\d*|nvme\d+n\d+p?\d*|mmcblk\d+p?\d*)$")
+rsync_install_running = False
+rsync_install_lock = threading.Lock()
+rsync_mounts = {"src": None, "dst": None}
+rsync_mounts_lock = threading.Lock()
+
+
+def _save_rsync_job(job):
+    """rsyncジョブ情報をメモリ＋ファイルに保存する"""
+    global rsync_job
+    with rsync_lock:
+        rsync_job = job
+    try:
+        with open(RSYNC_JOB_FILE, "w") as f:
+            json.dump(job, f)
+    except Exception:
+        pass
+
+
+def _load_rsync_job():
+    """メモリ優先、無ければファイルからrsyncジョブ情報を復元する"""
+    with rsync_lock:
+        if rsync_job is not None:
+            return dict(rsync_job)
+    try:
+        if os.path.exists(RSYNC_JOB_FILE):
+            with open(RSYNC_JOB_FILE, "r") as f:
+                job = json.load(f)
+            if isinstance(job, dict) and job.get("log_path"):
+                return job
+    except Exception:
+        pass
+    return None
+
+
+def _pid_is_rsync(pid):
+    """指定 pid が rsync 関係プロセスか確認する。PID 再利用の誤認防止用"""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            cmd = f.read().decode(errors="replace").lower()
+        return ("rsync" in cmd) or ("stdbuf" in cmd)
+    except Exception:
+        return True
+
+
+def _load_rsync_mounts():
+    """マウント追跡情報をメモリ優先、無ければファイルから復元する"""
+    with rsync_mounts_lock:
+        if rsync_mounts.get("src") is not None or rsync_mounts.get("dst") is not None:
+            return {"src": rsync_mounts.get("src"), "dst": rsync_mounts.get("dst")}
+    try:
+        if os.path.exists(RSYNC_MOUNT_FILE):
+            with open(RSYNC_MOUNT_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {"src": data.get("src"), "dst": data.get("dst")}
+    except Exception:
+        pass
+    return {"src": None, "dst": None}
+
+
+def _save_rsync_mounts(data):
+    """マウント追跡情報をメモリ＋ファイルに保存する"""
+    with rsync_mounts_lock:
+        rsync_mounts["src"] = data.get("src")
+        rsync_mounts["dst"] = data.get("dst")
+    try:
+        with open(RSYNC_MOUNT_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _rsync_side_dir(side):
+    """自前マウント用のベースディレクトリ"""
+    suffix = "src" if side == "src" else "dst"
+    return os.path.join(RSYNC_MOUNT_BASE, suffix)
+
+
+def _rsync_img_dir(side):
+    """イメージ用マウントのベースディレクトリ（パーティション毎に pN を作る）"""
+    suffix = "src" if side == "src" else "dst"
+    return os.path.join(RSYNC_MOUNT_BASE, suffix + "-img")
+
+
+def get_rsync_partitions():
+    """rsyncページ用：マウント可能なパーティション（＋単一FSのホールディスク）一覧"""
+    out = []
+    sys_disk = get_system_disk()
+    try:
+        r = subprocess.run(
+            ["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,LABEL,UUID"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return {"system_disk": sys_disk, "partitions": []}
+        data = json.loads(r.stdout or "{}")
+        disks = data.get("blockdevices", [])
+
+        def fmt_size(n):
+            try:
+                n = int(n or 0)
+            except Exception:
+                return ""
+            if n >= 1024**3:
+                return f"{n / (1024**3):.1f} GB"
+            if n >= 1024**2:
+                return f"{n / (1024**2):.1f} MB"
+            return f"{n} B"
+
+        for dev in disks:
+            dname = dev.get("name", "")
+            if not RSYNC_DEV_RE.match(f"/dev/{dname}") or dev.get("type") != "disk":
+                # 先頭が実ディスクでないもの（zram/loop/dm等）は除外
+                if dev.get("type") != "disk":
+                    continue
+                if not WIPE_PATH_RE.match(f"/dev/{dname}"):
+                    continue
+            dmodel = (dev.get("model") or "").strip()
+            dserial = (dev.get("serial") or "").strip()
+            dtran = (dev.get("tran") or "").strip()
+            disk_label = f"/dev/{dname}"
+            if dmodel:
+                disk_label += f" ({dmodel})"
+            children = dev.get("children") or []
+            # ホールディスク自体にFSがある場合（単一FS媒体）も候補にする
+            if (dev.get("fstype") or "").strip() and RSYNC_DEV_RE.match(f"/dev/{dname}"):
+                fstype = (dev.get("fstype") or "").strip()
+                mp = dev.get("mountpoint") or ""
+                label = f"/dev/{dname} - {fmt_size(dev.get('size', 0))} [{fstype}]"
+                if dmodel:
+                    label += f" ({dmodel})"
+                if mp:
+                    label += f" mounted:{mp}"
+                out.append({"path": f"/dev/{dname}", "disk": f"/dev/{dname}",
+                    "disk_label": disk_label, "size": fmt_size(dev.get("size", 0)),
+                    "size_bytes": int(dev.get("size", 0) or 0), "fstype": fstype,
+                    "mountpoint": mp, "label": label, "model": dmodel,
+                    "serial": dserial, "tran": dtran,
+                    "is_system": (f"/dev/{dname}" == sys_disk),
+                    "part_label": "", "part_uuid": (dev.get("uuid") or "").strip()})
+            for ch in children:
+                cname = ch.get("name", "")
+                cpath = f"/dev/{cname}"
+                if not RSYNC_DEV_RE.match(cpath):
+                    continue
+                fstype = (ch.get("fstype") or "").strip()
+                mp = ch.get("mountpoint") or ""
+                plabel = (ch.get("label") or "").strip()
+                puuid = (ch.get("uuid") or "").strip()
+                label = f"{cpath} - {fmt_size(ch.get('size', 0))}"
+                if fstype:
+                    label += f" [{fstype}]"
+                if plabel:
+                    label += f" \"{plabel}\""
+                label += f" ({disk_label})"
+                if mp:
+                    label += f" mounted:{mp}"
+                out.append({"path": cpath, "disk": f"/dev/{dname}",
+                    "disk_label": disk_label, "size": fmt_size(ch.get("size", 0)),
+                    "size_bytes": int(ch.get("size", 0) or 0), "fstype": fstype,
+                    "mountpoint": mp, "label": label, "model": dmodel,
+                    "serial": dserial, "tran": dtran,
+                    "is_system": (f"/dev/{dname}" == sys_disk),
+                    "part_label": plabel, "part_uuid": puuid})
+    except Exception:
+        pass
+    return {"system_disk": sys_disk, "partitions": out}
+
+
+def get_dev_mountpoint(path):
+    """指定デバイスの現在のマウントポイント（無ければ空文字）"""
+    try:
+        r = subprocess.run(["lsblk", "-n", "-o", "MOUNTPOINT", path],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            for line in (r.stdout or "").split("\n"):
+                if line.strip():
+                    return line.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def mount_rsync_device(side, path):
+    """パーティション等をマウント（済みなら再利用）し、マウントポイントを返す"""
+    if side not in ("src", "dst"):
+        return {"ok": False, "error": "side が不正です"}
+    path = (path or "").strip()
+    if not RSYNC_DEV_RE.match(path):
+        return {"ok": False, "error": f"不正なデバイス指定です: {path}"}
+    if not os.path.exists(path):
+        return {"ok": False, "error": f"デバイスが見つかりません: {path}"}
+    sys_disk = get_system_disk()
+    if side == "dst" and sys_disk:
+        try:
+            r = subprocess.run(["lsblk", "-n", "-o", "PKNAME", path],
+                capture_output=True, text=True, timeout=5)
+            parent = (r.stdout or "").strip().split("\n")[0].strip()
+            if path == sys_disk or (parent and f"/dev/{parent}" == sys_disk):
+                return {"ok": False, "error": f"{path} はシステムドライブのためコピー先に指定できません"}
+        except Exception:
+            pass
+    mp = get_dev_mountpoint(path)
+    mounts = _load_rsync_mounts()
+    if mp:
+        info = {"kind": "device", "dev": path, "mountpoint": mp,
+            "own_mount": False, "mounted_at": time.time()}
+        mounts[side] = info
+        _save_rsync_mounts(mounts)
+        return {"ok": True, "mountpoint": mp, "already_mounted": True, "info": info}
+    # 未マウント → 自前でマウントする
+    base = _rsync_side_dir(side)
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception as e:
+        return {"ok": False, "error": f"マウント先を作成できません: {e}"}
+    # 他デバイスで使用中の場合は解除してから使う
+    try:
+        r = subprocess.run(["mountpoint", "-q", base])
+        if r.returncode == 0:
+            subprocess.run(["umount", base], capture_output=True, timeout=30)
+    except Exception:
+        pass
+    if side == "src":
+        cmd = ["mount", "-o", "ro", path, base]
+    else:
+        cmd = ["mount", path, base]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        return {"ok": False, "error": f"マウント実行エラー: {e}"}
+    if r.returncode != 0:
+        err = ((r.stderr or r.stdout) or "").strip().split("\n")[0][:300]
+        # コピー元 ro 失敗時は NTFS のダーティ等が多いためヒント付きで返す
+        hint = ""
+        if side == "src" and ("ntfs" in err.lower() or "dirty" in err.lower() or "windows" in err.lower()):
+            hint = "（NTFS が異常終了している可能性があります。Windows で正常に終了したディスクをご利用ください）"
+        return {"ok": False, "error": f"マウント失敗: {err}{hint}"}
+    info = {"kind": "device", "dev": path, "mountpoint": base,
+        "own_mount": True, "mounted_at": time.time()}
+    mounts[side] = info
+    _save_rsync_mounts(mounts)
+    return {"ok": True, "mountpoint": base, "already_mounted": False, "info": info}
+
+
+def _losetup_detach(loopdev):
+    try:
+        subprocess.run(["losetup", "-d", loopdev],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass
+
+
+def mount_rsync_image(side, image):
+    """ddrescue等の .img イメージファイルを loop＋kpartx相当でマウントする（コピー元専用）"""
+    if side != "src":
+        return {"ok": False, "error": "イメージファイルはコピー元のみ指定できます"}
+    image = (image or "").strip()
+    if not image.startswith("/"):
+        return {"ok": False, "error": "イメージは絶対パスで指定してください"}
+    if not os.path.isfile(image):
+        return {"ok": False, "error": f"イメージファイルが見つかりません: {image}"}
+    try:
+        if os.path.getsize(image) <= 0:
+            return {"ok": False, "error": "イメージファイルのサイズが 0 です"}
+    except Exception as e:
+        return {"ok": False, "error": f"イメージファイルを確認できません: {e}"}
+    mounts = _load_rsync_mounts()
+    prev = mounts.get("src") or {}
+    # 同一イメージの再マウント要求で loop が生存していれば再利用する
+    if prev.get("kind") == "image" and prev.get("image") == image and prev.get("loop"):
+        loopdev = prev.get("loop")
+        alive = os.path.exists(loopdev)
+        ok_mounts = [m for m in (prev.get("mounts") or []) if os.path.ismount(m.get("mountpoint", ""))]
+        if alive and ok_mounts:
+            return {"ok": True, "mountpoint": ok_mounts[0]["mountpoint"],
+                "already_mounted": True, "loop": loopdev, "mounts": ok_mounts,
+                "info": prev}
+    # 前回の自前マウントを掃除する（他人のマウントは触らない）
+    unmount_rsync_side("src")
+    mounts = _load_rsync_mounts()
+    try:
+        r = subprocess.run(["losetup", "-f", "--show", "-P", image],
+            capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return {"ok": False, "error": "losetup が見つかりません（util-linux を導入してください）"}
+    except Exception as e:
+        return {"ok": False, "error": f"loop デバイスの確保に失敗: {e}"}
+    if r.returncode != 0:
+        err = ((r.stderr or r.stdout) or "").strip().split("\n")[0][:300]
+        return {"ok": False, "error": f"loop デバイスの確保に失敗: {err}"}
+    loopdev = (r.stdout or "").strip().split("\n")[0].strip()
+    if not loopdev.startswith("/dev/loop"):
+        return {"ok": False, "error": f"loop デバイスの取得に失敗しました: {loopdev}"}
+    try:
+        subprocess.run(["udevadm", "settle"], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    time.sleep(1)
+    # パーティション構成を調べる
+    cands = []
+    try:
+        r2 = subprocess.run(["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE,SIZE", loopdev],
+            capture_output=True, text=True, timeout=10)
+        if r2.returncode == 0:
+            data = json.loads(r2.stdout or "{}")
+            devs = data.get("blockdevices", [])
+            if devs:
+                top = devs[0]
+                for ch in (top.get("children") or []):
+                    cands.append(f"/dev/{ch.get('name', '')}")
+                if not cands and (top.get("fstype") or "").strip():
+                    cands.append(loopdev)
+    except Exception:
+        pass
+    if not cands:
+        # lsblk で取れない場合は単一FSとして直接マウントを試す
+        cands = [loopdev]
+    base = _rsync_img_dir("src")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception as e:
+        _losetup_detach(loopdev)
+        return {"ok": False, "error": f"マウント先を作成できません: {e}"}
+    ok_mounts = []
+    for idx, part in enumerate(cands):
+        if not part or not os.path.exists(part):
+            continue
+        # パーティション毎のマウント先（単一の場合は base 直下ではなく p0 を使う）
+        mp = os.path.join(base, f"p{idx}")
+        try:
+            os.makedirs(mp, exist_ok=True)
+        except Exception:
+            continue
+        try:
+            rr = subprocess.run(["mount", "-o", "ro", part, mp],
+                capture_output=True, text=True, timeout=60)
+        except Exception:
+            continue
+        if rr.returncode == 0:
+            fstype = ""
+            try:
+                rb = subprocess.run(["blkid", "-o", "value", "-s", "TYPE", part],
+                    capture_output=True, text=True, timeout=10)
+                fstype = (rb.stdout or "").strip().split("\n")[0].strip()
+            except Exception:
+                pass
+            ok_mounts.append({"dev": part, "mountpoint": mp, "fstype": fstype})
+    if not ok_mounts:
+        _losetup_detach(loopdev)
+        return {"ok": False, "error": "イメージ内にマウント可能なファイルシステムが見つかりませんでした"
+            "（パーティションテーブル破損・未対応FSの可能性があります）"}
+    info = {"kind": "image", "image": image, "loop": loopdev,
+        "mountpoint": ok_mounts[0]["mountpoint"], "mounts": ok_mounts,
+        "own_mount": True, "mounted_at": time.time()}
+    mounts["src"] = info
+    _save_rsync_mounts(mounts)
+    return {"ok": True, "mountpoint": ok_mounts[0]["mountpoint"],
+        "already_mounted": False, "loop": loopdev, "mounts": ok_mounts,
+        "info": info}
+
+
+def unmount_rsync_side(side):
+    """指定側の自前マウントを解除する（元からあるマウントは解除しない）"""
+    if side not in ("src", "dst"):
+        return {"ok": False, "error": "side が不正です"}
+    mounts = _load_rsync_mounts()
+    info = mounts.get(side)
+    if not info:
+        return {"ok": True, "message": "マウント情報がありません"}
+    errors = []
+    if (info.get("kind") == "image"):
+        for m in (info.get("mounts") or []):
+            mp = m.get("mountpoint", "")
+            if mp and os.path.ismount(mp):
+                try:
+                    r = subprocess.run(["umount", mp], capture_output=True, text=True, timeout=30)
+                    if r.returncode != 0:
+                        errors.append(f"{mp}: {((r.stderr or r.stdout) or '').strip().split(chr(10))[0][:150]}")
+                except Exception as e:
+                    errors.append(f"{mp}: {e}")
+        loopdev = info.get("loop", "")
+        if loopdev and os.path.exists(loopdev):
+            _losetup_detach(loopdev)
+    else:
+        if info.get("own_mount") and info.get("mountpoint"):
+            mp = info["mountpoint"]
+            if os.path.ismount(mp):
+                try:
+                    r = subprocess.run(["umount", mp], capture_output=True, text=True, timeout=30)
+                    if r.returncode != 0:
+                        errors.append(((r.stderr or r.stdout) or "").strip().split("\n")[0][:200])
+                except Exception as e:
+                    errors.append(str(e)[:200])
+        # own_mount でない（元からあるマウントの再利用）は解除しない
+    mounts[side] = None
+    _save_rsync_mounts(mounts)
+    if errors:
+        return {"ok": False, "error": "; ".join(errors)}
+    return {"ok": True, "message": "アンマウントしました"}
+
+
+def _rsync_allowed_roots(side):
+    """指定側でフォルダ指定を許可するルート（一覧・コピー時の脱出防止用）"""
+    mounts = _load_rsync_mounts()
+    info = mounts.get(side) or {}
+    roots = []
+    if info.get("kind") == "image":
+        for m in (info.get("mounts") or []):
+            mp = m.get("mountpoint", "")
+            if mp:
+                roots.append(os.path.realpath(mp))
+        imgbase = os.path.realpath(_rsync_img_dir("src" if side == "src" else "dst"))
+        roots.append(imgbase)
+    elif info.get("mountpoint"):
+        roots.append(os.path.realpath(info["mountpoint"]))
+    # 実マウント点の再確認（追跡情報が古い場合の補正）
+    if info.get("kind") == "device" and info.get("dev"):
+        mp = get_dev_mountpoint(info["dev"])
+        if mp and os.path.realpath(mp) not in roots:
+            roots.append(os.path.realpath(mp))
+    return [r for r in roots if r]
+
+
+def _rsync_resolve_base(side, base, must_exist=True):
+    """フォルダ指定を検証し、実パスを返す。NG時は (None, エラー文)"""
+    base = (base or "").strip()
+    if not base:
+        return None, "フォルダを指定してください"
+    if not base.startswith("/"):
+        return None, "フォルダは絶対パスで指定してください"
+    roots = _rsync_allowed_roots(side)
+    if not roots:
+        return None, "先にドライブをマウントしてください"
+    real = os.path.realpath(base)
+    if not any(real == r or real.startswith(r + os.sep) for r in roots):
+        return None, f"マウント外のパスは指定できません（マウント点: {', '.join(roots)}）"
+    if must_exist:
+        if not os.path.exists(real):
+            return None, f"フォルダが見つかりません: {base}"
+        if not os.path.isdir(real):
+            return None, f"フォルダではありません: {base}"
+    return real, ""
+
+
+def list_rsync_dir(side, base):
+    """コピー元フォルダ直下のフォルダ・ファイル一覧を返す"""
+    real, err = _rsync_resolve_base(side, base, must_exist=True)
+    if err:
+        return {"ok": False, "error": err}
+    entries = []
+    truncated = False
+    try:
+        names = sorted(os.listdir(real))
+    except Exception as e:
+        return {"ok": False, "error": f"一覧を取得できません: {e}"}
+    for name in names:
+        if len(entries) >= 2000:
+            truncated = True
+            break
+        p = os.path.join(real, name)
+        try:
+            if os.path.islink(p):
+                kind = "link"
+            elif os.path.isdir(p):
+                kind = "dir"
+            elif os.path.isfile(p):
+                kind = "file"
+            else:
+                kind = "other"
+            st = os.lstat(p)
+            entries.append({"name": name, "type": kind,
+                "size": st.st_size, "size_h": _fmt_bytes(st.st_size),
+                "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))})
+        except Exception:
+            entries.append({"name": name, "type": "unknown",
+                "size": 0, "size_h": "-", "mtime": ""})
+    # フォルダ優先＋名前順
+    entries.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["name"].lower()))
+    return {"ok": True, "base": real, "entries": entries, "truncated": truncated,
+        "count": len(entries)}
+
+
+def _fmt_bytes(n):
+    try:
+        n = int(n)
+    except Exception:
+        return "-"
+    if n >= 1024**3:
+        return f"{n / (1024**3):.2f} GB"
+    if n >= 1024**2:
+        return f"{n / (1024**2):.2f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def get_rsync_status():
+    """rsync コマンドの導入状態を返す"""
+    has_rsync = shutil.which("rsync") is not None
+    with rsync_install_lock:
+        installing = rsync_install_running
+    return {"installed": has_rsync, "installing": installing}
+
+
+def _run_rsync_install():
+    """rsync をバックグラウンドで導入する"""
+    global rsync_install_running
+    log_path = os.path.join(LOG_DIR, "rsync-install.log")
+    try:
+        with open(log_path, "w") as f:
+            f.write(f"=== rsync install started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.flush()
+            os_id, os_like = "", ""
+            try:
+                with open("/etc/os-release") as of:
+                    for line in of:
+                        if line.startswith("ID="):
+                            os_id = line.split("=", 1)[1].strip().strip('"').lower()
+                        elif line.startswith("ID_LIKE="):
+                            os_like = line.split("=", 1)[1].strip().strip('"').lower()
+            except Exception:
+                pass
+            is_arch = ("arch" in os_like) or os_id in ("arch", "cachyos") or \
+                (shutil.which("pacman") and not shutil.which("apt-get"))
+            if is_arch:
+                cmd = ["pacman", "-Sy", "--noconfirm", "--needed", "rsync"]
+            else:
+                f.write("$ apt-get update\n")
+                f.flush()
+                r0 = subprocess.run(["apt-get", "update"], stdout=f, stderr=subprocess.STDOUT, timeout=600)
+                if r0.returncode != 0:
+                    f.write(f"apt-get update failed (code={r0.returncode})\n")
+                cmd = ["apt-get", "install", "-y", "rsync"]
+            f.write(f"$ {' '.join(cmd)}\n")
+            f.flush()
+            r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=3600)
+            f.write(f"\n=== finished code={r.returncode} ===\n")
+    except Exception as e:
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"install error: {e}\n")
+        except Exception:
+            pass
+    finally:
+        with rsync_install_lock:
+            rsync_install_running = False
+
+
+def get_rsync_progress():
+    """実行中 rsync の進捗をログ解析で推定する（--info=progress2 の出力利用）"""
+    job = _load_rsync_job()
+    adopted = False
+    if running_process is not None and running_process.poll() is None:
+        if job and job.get("pid") == running_process.pid:
+            running, rc = True, None
+        else:
+            running, rc = False, None
+    elif job and job.get("pid") and _pid_is_rsync(job.get("pid")):
+        running, rc, adopted = True, None, True
+    else:
+        running = False
+        rc = None if running_process is None else running_process.poll()
+    if not job:
+        return {"running": running, "job": None}
+    log_file = job.get("log_path", "")
+    text = ""
+    try:
+        if log_file and os.path.exists(log_file):
+            with open(log_file, "r", errors="replace") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 131072))
+                text = f.read()
+    except Exception:
+        pass
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r", "\n")
+    # --info=progress2 の「12,345  45% ... (xfr#12, to-chk=3/10)」形式から直近値を採用
+    pcts = re.findall(r"([\d,]+)\s+(\d{1,3})%\s+[\d.]+\s*\S*/s", text)
+    percent = 0.0
+    speed = ""
+    if pcts:
+        try:
+            percent = min(100.0, max(0.0, float(pcts[-1][1])))
+        except Exception:
+            percent = 0.0
+    else:
+        bare = re.findall(r"(?:^|\n)\s*[\d,]+\s+(\d{1,3})%", text)
+        if bare:
+            try:
+                percent = min(100.0, max(0.0, float(bare[-1])))
+            except Exception:
+                pass
+    speeds = re.findall(r"(\d[\d.]*\s*[KMGT]?B/s)", text)
+    if speeds:
+        speed = speeds[-1]
+    xfrs = re.findall(r"xfr#(\d+)", text)
+    xfr = xfrs[-1] if xfrs else ""
+    tochs = re.findall(r"to-chk=(\d+)/(\d+)", text)
+    toch = f"{tochs[-1][0]}/{tochs[-1][1]}" if tochs else ""
+    failed = ("rsync error" in text) or ("rsync: " in text and "failed" in text.lower())
+    # 現在のフェーズ（直近のファイル行。進捗行・空行は除外）
+    phase = ""
+    try:
+        noise_re = re.compile(r"^\s*[\d,]+\s+\d{1,3}%|xfr#|to-chk=|^sending|^sent |^total size|^receiving|^\s*$")
+        cands = [ln.strip()[:110] for ln in text.split("\n")
+            if ln.strip() and not noise_re.search(ln.strip())]
+        if cands:
+            phase = cands[-1]
+    except Exception:
+        pass
+    if running:
+        status = "running"
+    elif rc == 0 and not failed:
+        status = "done"
+        percent = 100.0
+    elif rc is not None and rc < 0:
+        status = "stopped"
+    elif rc is None:
+        status = "unknown"
+    else:
+        status = "error"
+    elapsed = int(time.time() - job.get("started_at", time.time()))
+    return {"running": running, "returncode": rc,
+        "status": status, "adopted": adopted,
+        "job": job,
+        "percent": round(percent, 1),
+        "speed": speed, "transferred_files": xfr, "to_check": toch,
+        "phase": phase, "failed": failed,
+        "elapsed_sec": elapsed, "log_file": job.get("log_file", "")}
+
+
 def _split_ocs_image(path):
     """Clonezilla イメージ指定「/dir/NAME」を (ocsroot_dir, image_name) に分割"""
     p = (path or "").strip()
@@ -1129,6 +1778,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json(get_clone_progress())
         elif p.path == "/api/rescue/progress":
             self._json(get_rescue_progress())
+        elif p.path == "/api/rsync/check":
+            self._json(get_rsync_status())
+        elif p.path == "/api/rsync/partitions":
+            self._json(get_rsync_partitions())
+        elif p.path == "/api/rsync/list":
+            q = parse_qs(p.query)
+            side = q.get("side", ["src"])[0]
+            base = q.get("base", [""])[0]
+            if side not in ("src", "dst"):
+                self._json({"ok": False, "error": "side が不正です"}, 400)
+            elif not base:
+                self._json({"ok": False, "error": "base が必要です"}, 400)
+            else:
+                res = list_rsync_dir(side, base)
+                self._json(res, 200 if res.get("ok") else 400)
+        elif p.path == "/api/rsync/mounts":
+            self._json(_load_rsync_mounts())
+        elif p.path == "/api/rsync/progress":
+            self._json(get_rsync_progress())
         else:
             super().do_GET()
 
@@ -1149,6 +1817,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/clone/start": self._handle_clone_start(data)
         elif p.path == "/api/clone/unmount": self._handle_clone_unmount(data)
         elif p.path == "/api/clone/stop": self._handle_stop()
+        elif p.path == "/api/rsync/install": self._handle_rsync_install()
+        elif p.path == "/api/rsync/mount": self._handle_rsync_mount(data)
+        elif p.path == "/api/rsync/mount-image": self._handle_rsync_mount_image(data)
+        elif p.path == "/api/rsync/unmount": self._handle_rsync_unmount(data)
+        elif p.path == "/api/rsync/mkdir": self._handle_rsync_mkdir(data)
+        elif p.path == "/api/rsync/start": self._handle_rsync_start(data)
+        elif p.path == "/api/rsync/stop": self._handle_stop()
         else: self._json({"error": "not found"}, 404)
 
     def do_OPTIONS(self):
@@ -1219,16 +1894,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json({"error": str(e)})
 
     def _adopted_clone_pid(self):
-        """サービス再起動後に取り残されたクローンプロセスの pid を返す（無ければ None）"""
+        """サービス再起動後に取り残されたクローン／rsyncプロセスの pid を返す（無ければ None）"""
         if running_process is not None and running_process.poll() is None:
             return None  # 自プロセスで管理中
         job = _load_clone_job()
         if job and job.get("pid") and _pid_is_clone(job.get("pid")):
             return int(job.get("pid"))
+        rjob = _load_rsync_job()
+        if rjob and rjob.get("pid") and _pid_is_rsync(rjob.get("pid")):
+            return int(rjob.get("pid"))
         return None
 
     def _any_running(self):
-        """自管理プロセスまたは引き継ぎクローンのいずれかが実行中か"""
+        """自管理プロセスまたは引き継ぎクローン／rsyncのいずれかが実行中か"""
         if running_process is not None and running_process.poll() is None:
             return True
         return self._adopted_clone_pid() is not None
@@ -1617,6 +2295,185 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 results.append({"path": path, "ok": True, "unmounted": unmounted})
         self._json({"ok": all_ok, "results": results},
             200 if all_ok else 400)
+
+    def _handle_rsync_install(self):
+        global rsync_install_running
+        st = get_rsync_status()
+        if st["installed"]:
+            self._json({"ok": True, "already": True}); return
+        with rsync_install_lock:
+            if rsync_install_running:
+                self._json({"ok": True, "installing": True}); return
+            rsync_install_running = True
+        if self._any_running():
+            with rsync_install_lock:
+                rsync_install_running = False
+            self._json({"error": "レスキュー／クローン／コピー実行中はインストールできません"}); return
+        if self._wipe_running():
+            with rsync_install_lock:
+                rsync_install_running = False
+            self._json({"error": "ディスク消去実行中はインストールできません"}); return
+        th = threading.Thread(target=_run_rsync_install, daemon=True)
+        th.start()
+        self._json({"ok": True, "installing": True})
+
+    def _handle_rsync_mount(self, data):
+        if self._any_running():
+            self._json({"error": "実行中はマウント操作できません"}); return
+        side = (data.get("side") or "src").strip()
+        path = (data.get("path") or "").strip()
+        if side not in ("src", "dst"):
+            self._json({"error": "side が不正です"}); return
+        if not path:
+            self._json({"error": "デバイスを指定してください"}); return
+        res = mount_rsync_device(side, path)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_rsync_mount_image(self, data):
+        if self._any_running():
+            self._json({"error": "実行中はマウント操作できません"}); return
+        image = (data.get("image") or data.get("path") or "").strip()
+        if not image:
+            self._json({"error": "イメージファイルを指定してください"}); return
+        res = mount_rsync_image("src", image)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_rsync_unmount(self, data):
+        if self._any_running():
+            self._json({"error": "実行中はアンマウントできません"}); return
+        side = (data.get("side") or "src").strip()
+        if side not in ("src", "dst"):
+            self._json({"error": "side が不正です"}); return
+        res = unmount_rsync_side(side)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_rsync_mkdir(self, data):
+        if self._any_running():
+            self._json({"error": "実行中は作成できません"}); return
+        side = (data.get("side") or "dst").strip()
+        if side != "dst":
+            self._json({"error": "作成はコピー先のみ対応しています"}); return
+        path = (data.get("path") or "").strip()
+        if not path or not path.startswith("/"):
+            self._json({"error": "コピー先フォルダは絶対パスで指定してください"}); return
+        roots = _rsync_allowed_roots("dst")
+        if not roots:
+            self._json({"error": "先にコピー先ドライブをマウントしてください"}); return
+        real = os.path.realpath(path)
+        if not any(real == r or real.startswith(r + os.sep) for r in roots):
+            self._json({"error": f"マウント外のパスは作成できません（マウント点: {', '.join(roots)}）"}); return
+        try:
+            os.makedirs(real, exist_ok=True)
+        except Exception as e:
+            self._json({"error": f"作成失敗: {e}"}); return
+        self._json({"ok": True, "path": real})
+
+    def _handle_rsync_start(self, data):
+        global running_process, current_log_file
+        if self._any_running():
+            self._json({"error": "既に実行中です"}); return
+        if self._wipe_running():
+            self._json({"error": "ディスク消去実行中はコピーできません"}); return
+        if shutil.which("rsync") is None:
+            self._json({"error": "rsync がインストールされていません。先にインストールしてください"}); return
+        src_base_in = (data.get("src_base") or "").strip()
+        dst_base_in = (data.get("dst_base") or "").strip()
+        items = data.get("items") or []
+        opts = data.get("options") or {}
+        if not src_base_in:
+            self._json({"error": "コピー元フォルダを指定してください"}); return
+        if not dst_base_in:
+            self._json({"error": "コピー先フォルダを指定してください"}); return
+        if not isinstance(items, list) or not items:
+            self._json({"error": "コピーするフォルダ・ファイルを1つ以上選択してください"}); return
+        src_base, err = _rsync_resolve_base("src", src_base_in, must_exist=True)
+        if err:
+            self._json({"error": f"コピー元フォルダ: {err}"}); return
+        # コピー先は無ければ作成する
+        dst_roots = _rsync_allowed_roots("dst")
+        if not dst_roots:
+            self._json({"error": "先にコピー先ドライブをマウントしてください"}); return
+        dst_real = os.path.realpath(dst_base_in)
+        if not dst_base_in.startswith("/"):
+            self._json({"error": "コピー先フォルダは絶対パスで指定してください"}); return
+        if not any(dst_real == r or dst_real.startswith(r + os.sep) for r in dst_roots):
+            self._json({"error": f"コピー先はマウント内を指定してください（マウント点: {', '.join(dst_roots)}）"}); return
+        # コピー元とコピー先が同一フォルダの場合は拒否
+        if os.path.realpath(src_base) == dst_real:
+            self._json({"error": "コピー元とコピー先が同じフォルダです"}); return
+        # コピー先がコピー元配下／逆の包含関係は誤コピー防止のため拒否
+        if dst_real.startswith(os.path.realpath(src_base) + os.sep):
+            # 同一マウント内の別フォルダは通常あり得るが、無限再帰の恐れがあるため確認済み扱いでも拒否しない。
+            # ここでは許可する（rsync の典型的な使い方のため）
+            pass
+        # 選択項目の検証
+        clean_items = []
+        seen = set()
+        for raw in items:
+            name = (raw or "").strip()
+            if not name or name in seen:
+                continue
+            if os.path.isabs(name) or ".." in name.split("/"):
+                self._json({"error": f"不正な選択項目です: {name}"}); return
+            full = os.path.realpath(os.path.join(src_base, name))
+            allowed_root = os.path.realpath(src_base)
+            if not (full == allowed_root or full.startswith(allowed_root + os.sep)):
+                self._json({"error": f"不正な選択項目です: {name}"}); return
+            if not os.path.exists(full):
+                self._json({"error": f"見つかりません: {name}"}); return
+            seen.add(name)
+            clean_items.append(name)
+        if not clean_items:
+            self._json({"error": "コピーするフォルダ・ファイルを1つ以上選択してください"}); return
+        if len(clean_items) > 2000:
+            self._json({"error": "選択項目が多すぎます（2000件まで）"}); return
+        # コピー先フォルダは無ければ作成
+        created = False
+        try:
+            if not os.path.exists(dst_real):
+                os.makedirs(dst_real, exist_ok=True)
+                created = True
+            if not os.path.isdir(dst_real):
+                self._json({"error": f"コピー先がフォルダではありません: {dst_base_in}"}); return
+        except Exception as e:
+            self._json({"error": f"コピー先フォルダを作成できません: {e}"}); return
+        # コマンド組み立て（進捗表示・詳細出力は常に有効。-r/-t/-u のみ切替）
+        cmd = ["stdbuf", "-o0", "-e0", "rsync", "-v", "-h", "--info=progress2", "--stats"]
+        if opts.get("recursive", True):
+            cmd.append("-r")
+        if opts.get("timestamps", True):
+            cmd.append("-t")
+        if opts.get("update", True):
+            cmd.append("-u")
+        srcs = [os.path.join(src_base, n) for n in clean_items]
+        cmd += srcs + [dst_real]
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_name = f"rsync_{timestamp}.log"
+        current_log_file = os.path.join(LOG_DIR, log_name)
+        try:
+            log_f = open(current_log_file, "w")
+            log_f.write(f"=== rsync started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            log_f.write(f"Command: {' '.join(shlex.quote(c) for c in cmd)}\n")
+            log_f.write(f"src_base={src_base} dst_base={dst_real} items={len(clean_items)} "
+                f"recursive={bool(opts.get('recursive', True))} "
+                f"timestamps={bool(opts.get('timestamps', True))} "
+                f"update={bool(opts.get('update', True))} created_dst={created}\n\n")
+            log_f.flush()
+            running_process = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
+            log_f.close()
+            _save_rsync_job({"src_base": src_base, "dst_base": dst_real,
+                "items": clean_items, "options": {
+                    "recursive": bool(opts.get("recursive", True)),
+                    "timestamps": bool(opts.get("timestamps", True)),
+                    "update": bool(opts.get("update", True))},
+                "started_at": time.time(), "log_file": log_name, "log_path": current_log_file,
+                "pid": running_process.pid})
+            self._json({"ok": True, "log_file": log_name, "pid": running_process.pid,
+                "created_dst": created})
+        except FileNotFoundError:
+            self._json({"error": "rsync コマンドが見つかりません"})
+        except Exception as e:
+            self._json({"error": str(e)})
 
     def _sse_send(self, text):
         escaped = text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
