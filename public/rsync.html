@@ -148,6 +148,9 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
             </div>
             <div class="side-section">
                 <h3>コピー先</h3>
+                <div class="type-toggle" id="dst-toggle">
+                    <button class="active" type="button" style="cursor:default">物理ドライブ</button>
+                </div>
                 <select id="dest" onchange="mountDstDevice()">
                     <option value="">-- パーティションを選択 --</option>
                 </select>
