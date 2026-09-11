@@ -12,7 +12,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -1740,12 +1740,18 @@ def _part_number(disk, part):
 
 
 def _parted_parse_free(disk):
-    """parted の print free を解析し (テーブル種別, パーティション番号→(start,end), 空き一覧) を返す"""
+    """parted の print free を解析し (テーブル種別, パーティション番号→(start,end), 空き一覧) を返す
+    パーティションテーブルが無い場合（未初期化）は table に "unknown" を返す"""
     table = ""
     bounds = {}
     frees = []
     rc, out = _run_cmd(["parted", "-s", disk, "unit", "B", "print", "free"], timeout=30)
     if rc != 0:
+        # 未初期化ディスクは parted が非ゼロ終了＋「ディスクラベルが認識できません」等を出す
+        low = (out or "").lower()
+        if ("unknown" in low or "認識できません" in (out or "")
+                or "unrecognised" in low or "unrecognized" in low):
+            return "unknown", bounds, frees
         return table, bounds, frees
     for line in out.split("\n"):
         s = line.strip()
@@ -1852,6 +1858,9 @@ def get_part_devices():
             if int(f.get("size_bytes", 0) or 0) < MIB:
                 continue
             free_list.append({**f, "size": _fmt_bytes(f["size_bytes"])})
+        # パーティションテーブルが無い未初期化ディスク（/dev/sdc等の空ドライブ）は
+        # 初期化→作成フローで扱えるようフラグを立てる
+        needs_init = (table in ("", "unknown")) and not partitions and not free_list
         label = f"/dev/{name} - {_fmt_bytes(size_bytes)}"
         if model:
             label += f" ({model})"
@@ -1863,6 +1872,7 @@ def get_part_devices():
             "size": _fmt_bytes(size_bytes), "size_bytes": size_bytes,
             "model": model, "serial": serial, "tran": tran, "label": label,
             "table": table or "不明",
+            "needs_init": needs_init,
             "partitions": partitions, "free_spaces": free_list,
             "has_mount": has_mount, "is_system": (disk == sys_disk)})
     return devices
@@ -1892,6 +1902,39 @@ def _part_guard(path, for_create_disk=False):
     if not shutil.which("parted"):
         return None, "parted が利用できません（先にツールをインストールしてください）"
     return disk, ""
+
+
+def part_mklabel(disk, table_type):
+    """未初期化ディスクにパーティションテーブルを作成する（gpt/msdosのみ）"""
+    disk = (disk or "").strip()
+    table_type = (table_type or "").strip().lower()
+    if not WIPE_PATH_RE.match(disk):
+        return {"ok": False, "error": f"不正なデバイス指定です: {disk}"}
+    if table_type not in ("gpt", "msdos"):
+        return {"ok": False, "error": f"テーブル種別は gpt/msdos を指定してください: {table_type}"}
+    d, err = _part_guard(disk, for_create_disk=True)
+    if err:
+        return {"ok": False, "error": err}
+    # ディスク全体にFSがある媒体や既存パーティションがある場合は初期化を拒否
+    try:
+        r = subprocess.run(["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE", disk],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "{}")
+        devs = data.get("blockdevices", [])
+        if devs:
+            top = devs[0]
+            if (top.get("fstype") or "").strip():
+                return {"ok": False, "error": f"{disk} 全体にファイルシステムがあるため初期化できません（データを退避してから消去してください）"}
+            if top.get("children"):
+                return {"ok": False, "error": f"{disk} には既にパーティションがあるため初期化できません"}
+    except Exception:
+        pass
+    rc, out = _run_cmd(["parted", "-s", disk, "mklabel", table_type], timeout=120)
+    if rc != 0:
+        return {"ok": False, "error": f"パーティションテーブルの作成に失敗しました: {out[:300]}"}
+    _part_refresh(disk)
+    name = "GPT" if table_type == "gpt" else "MBR(msdos)"
+    return {"ok": True, "message": f"{disk} を {name} で初期化しました"}
 
 
 def part_delete(part):
@@ -1936,8 +1979,9 @@ PART_MKFS = {
 }
 
 
-def part_create(disk, fstype, size_bytes, label="", start_bytes=None):
-    """空き領域にパーティションを作成し、ファイルシステムを初期化する"""
+def part_create(disk, fstype, size_bytes, label="", start_bytes=None, table_type=""):
+    """空き領域にパーティションを作成し、ファイルシステムを初期化する
+    未初期化ディスクでは table_type（gpt/msdos、既定gpt）で先に初期化してから作成する"""
     disk = (disk or "").strip()
     fstype = (fstype or "").strip().lower()
     try:
@@ -1959,6 +2003,29 @@ def part_create(disk, fstype, size_bytes, label="", start_bytes=None):
         return {"ok": False, "error": "vfat のラベルは11文字までです"}
     if size_bytes < 16 * MIB:
         return {"ok": False, "error": "サイズは 16MiB 以上を指定してください"}
+    # 未初期化ディスクは先にパーティションテーブルを作成する
+    table, _, frees = _parted_parse_free(disk)
+    if table in ("", "unknown") and not frees:
+        want = (table_type or "gpt").strip().lower()
+        if want not in ("gpt", "msdos"):
+            return {"ok": False, "error": f"テーブル種別は gpt/msdos を指定してください: {table_type}"}
+        # 既存データの誤消去を防ぐため全体FSがあれば拒否する
+        try:
+            r = subprocess.run(["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE", disk],
+                capture_output=True, text=True, timeout=10)
+            data = json.loads(r.stdout or "{}")
+            devs = data.get("blockdevices", [])
+            if devs:
+                top = devs[0]
+                if (top.get("fstype") or "").strip():
+                    return {"ok": False, "error": f"{disk} 全体にファイルシステムがあるため作成できません"}
+                if not top.get("children"):
+                    rc, out = _run_cmd(["parted", "-s", disk, "mklabel", want], timeout=120)
+                    if rc != 0:
+                        return {"ok": False, "error": f"パーティションテーブルの作成に失敗しました: {out[:300]}"}
+                    _part_refresh(disk)
+        except Exception as e:
+            return {"ok": False, "error": f"ディスク状態の確認に失敗しました: {e}"}
     # 空き領域の選定（指定開始位置が無ければ収まる最初の領域）
     _, _, frees = _parted_parse_free(disk)
     cands = [f for f in frees if int(f.get("size_bytes", 0) or 0) >= size_bytes + MIB]
@@ -2666,6 +2733,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/part/unmount": self._handle_part_unmount(data)
         elif p.path == "/api/part/delete": self._handle_part_delete(data)
         elif p.path == "/api/part/create": self._handle_part_create(data)
+        elif p.path == "/api/part/mklabel": self._handle_part_mklabel(data)
         elif p.path == "/api/part/resize": self._handle_part_resize(data)
         else: self._json({"error": "not found"}, 404)
 
@@ -3219,6 +3287,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         disk = (data.get("disk") or "").strip()
         fstype = (data.get("fstype") or "").strip()
         label = (data.get("label") or "").strip()
+        table_type = (data.get("table") or data.get("table_type") or "").strip()
         if not disk:
             self._json({"error": "対象ディスクを指定してください"}); return
         if not fstype:
@@ -3231,7 +3300,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 size_bytes = 0
         start_bytes = data.get("start_bytes")
-        res = part_create(disk, fstype, size_bytes, label, start_bytes)
+        res = part_create(disk, fstype, size_bytes, label, start_bytes, table_type)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_part_mklabel(self, data):
+        err = self._part_busy_guard()
+        if err:
+            self._json({"error": err}); return
+        disk = (data.get("disk") or "").strip()
+        table_type = (data.get("table") or data.get("table_type") or "").strip()
+        if not disk:
+            self._json({"error": "対象ディスクを指定してください"}); return
+        res = part_mklabel(disk, table_type)
         self._json(res, 200 if res.get("ok") else 400)
 
     def _handle_part_resize(self, data):

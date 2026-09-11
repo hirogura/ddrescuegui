@@ -72,7 +72,7 @@ input[type=range]{width:100%;accent-color:#38bdf8}
 <body>
 <div class="header">
     <h1>パーティション操作</h1>
-    <span class="version">v.1.8.1</span>
+    <span class="version">v.1.8.3</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
         <button class="btn-header" onclick="loadAll()">リフレッシュ</button>
@@ -221,6 +221,24 @@ function renderDisk(d) {
     div.className = 'dev';
     const sysBadge = d.is_system ? '<span class="sys-badge">システム（操作不可）</span>' : '';
     const mntNote = (!d.is_system && d.has_mount) ? '<div class="mount-warn">※ マウント中のパーティションは操作前にアンマウントしてください</div>' : '';
+    // パーティションテーブルが無い未初期化ディスク（/dev/sdc等の空ドライブ）は
+    // ディスク全体を選択して初期化→作成できるようにする
+    const tableLabel = d.needs_init ? 'なし（未初期化）' : (d.table || '不明');
+    if (d.needs_init && !d.is_system) {
+        const selected = (sel && sel.kind === 'uninit' && sel.disk === d.path) ? ' selected' : '';
+        const bar = '<div class="pbar"><div class="seg free' + selected + '" style="width:100%" ' +
+            'title="未初期化領域 ' + esc(d.size) + '" onclick="selectUninit(\'' + esc(d.path) + '\')">' +
+            '<div class="seg-label">未初期化 ' + esc(d.size) + ' — クリックで作成</div></div></div>';
+        const rows = '<tr class="clickable' + (selected ? ' row-sel' : '') + '" onclick="selectUninit(\'' + esc(d.path) + '\')">' +
+            '<td>未初期化領域</td><td>' + esc(d.size) + '</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>';
+        div.innerHTML =
+            '<div class="dev-path">' + esc(d.path) + ' — ' + esc(d.size) + ' [' + esc(tableLabel) + ']' + sysBadge + '</div>' +
+            '<div class="dev-meta">モデル: ' + esc(d.model || '-') + ' / シリアル: <span class="serial">' + esc(d.serial || '-') + '</span> / 接続: ' + esc(d.tran || '不明') + '</div>' +
+            '<div class="help-text" style="margin-top:8px">パーティションテーブルがありません。選択すると初期化（GPT/MBR）＋パーティション作成ができます。</div>' +
+            bar +
+            '<table class="part-table"><tr><th>パーティション</th><th>容量</th><th>FS</th><th>使用率</th><th>ラベル</th><th>マウント</th></tr>' + rows + '</table>';
+        return div;
+    }
     // グラフィカルバー用の全セグメント（パーティション＋空きをバイト順に整列）
     const total = d.size_bytes || 1;
     let items = [];
@@ -272,7 +290,7 @@ function renderDisk(d) {
     });
     if (!rows) rows = '<tr><td colspan="6">パーティション情報がありません</td></tr>';
     div.innerHTML =
-        '<div class="dev-path">' + esc(d.path) + ' — ' + esc(d.size) + ' [' + esc(d.table || '不明') + ']' + sysBadge + '</div>' +
+        '<div class="dev-path">' + esc(d.path) + ' — ' + esc(d.size) + ' [' + esc(tableLabel) + ']' + sysBadge + '</div>' +
         '<div class="dev-meta">モデル: ' + esc(d.model || '-') + ' / シリアル: <span class="serial">' + esc(d.serial || '-') + '</span> / 接続: ' + esc(d.tran || '不明') + '</div>' +
         mntNote + bar +
         '<table class="part-table"><tr><th>パーティション</th><th>容量</th><th>FS</th><th>使用率</th><th>ラベル</th><th>マウント</th></tr>' + rows + '</table>';
@@ -291,6 +309,13 @@ function selectSeg(disk, kind, key) {
         if (!f) return;
         sel = {disk: disk, kind: 'free', free: f, freeStart: f.start_bytes, isSystem: d.is_system};
     }
+    loadDevicesRefresh();
+}
+
+function selectUninit(disk) {
+    const d = devices.find(x => x.path === disk);
+    if (!d) return;
+    sel = {disk: disk, kind: 'uninit', isSystem: d.is_system};
     loadDevicesRefresh();
 }
 
@@ -325,6 +350,28 @@ function renderOp() {
         return;
     }
     const d = devices.find(x => x.path === sel.disk);
+    if (sel.kind === 'uninit') {
+        // 未初期化ディスク：テーブル種別を選び、初期化＋作成を一括実行する
+        // （管理領域を除いた概算上限。厳密な空きは初期化後に確定する）
+        const maxMiB = d && d.size_bytes ? Math.max(16, fmtMiB(d.size_bytes) - 2) : 16;
+        body.innerHTML =
+            '<div class="op-info"><b>' + esc(sel.disk) + '</b> は未初期化ディスクです（' + esc(d ? d.size : '') + '）。<br>' +
+            'パーティションテーブルを作成して新規パーティションを作成します。</div>' +
+            '<div class="form-group"><label>パーティションテーブル</label>' +
+            '<select id="mk-table"><option value="gpt">GPT（推奨・2TB超対応）</option><option value="msdos">MBR（旧式・2TB以下）</option></select></div>' +
+            '<div class="form-group"><label>ファイルシステム</label>' +
+            '<select id="mk-fstype"><option value="ext4">ext4（Linux標準）</option><option value="btrfs">btrfs</option>' +
+            '<option value="xfs">xfs</option><option value="ntfs">ntfs（Windows共用）</option>' +
+            '<option value="vfat">vfat(FAT32・共用)</option><option value="exfat">exfat（共用・大容量）</option></select></div>' +
+            '<div class="form-group"><label>サイズ（MiB）<span style="color:#64748b">：最大 ' + maxMiB + ' MiB</span></label>' +
+            '<input type="range" id="mk-size" min="16" max="' + maxMiB + '" value="' + maxMiB + '" oninput="document.getElementById(\'mk-size-num\').value=this.value">' +
+            '<input type="number" id="mk-size-num" value="' + maxMiB + '" min="16" max="' + maxMiB + '" oninput="document.getElementById(\'mk-size\').value=this.value"></div>' +
+            '<div class="form-group"><label>ラベル（任意）</label><input type="text" id="mk-label" placeholder="例: data" maxlength="32">' +
+            '<div class="help-text">vfat は11文字まで（自動で大文字化）。空欄可。</div></div>' +
+            '<div class="btn-group"><button class="btn btn-primary" onclick="doCreateUninit()" ' + (busy ? 'disabled' : '') + '>初期化してパーティションを作成</button></div>' +
+            '<div class="note">※ ディスク先頭の管理領域にテーブルを書き込むため、既存データがある場合は失われます。</div>';
+        return;
+    }
     if (sel.kind === 'part') {
         const p = sel.part;
         const curMiB = fmtMiB(p.size_bytes);
@@ -419,6 +466,30 @@ async function doCreate() {
         setBusy(true);
         const res = await fetch('/api/part/create', {method:'POST', headers:{'Content-Type':'application/json'},
             body: JSON.stringify({disk: sel.disk, fstype: fstype, size_mib: sizeMiB, label: label, start_bytes: sel.free.start_bytes})});
+        const data = await res.json();
+        setBusy(false);
+        if (!data.ok) { notify('エラー: ' + (data.error || '失敗'), 'error'); return; }
+        notify(data.message, 'success');
+        sel = null;
+        await loadDevices();
+    } catch(e) { setBusy(false); notify('通信エラー: ' + e.message, 'error'); }
+}
+
+async function doCreateUninit() {
+    if (!sel || sel.kind !== 'uninit') return;
+    const table = document.getElementById('mk-table').value;
+    const fstype = document.getElementById('mk-fstype').value;
+    const sizeMiB = parseFloat(document.getElementById('mk-size-num').value);
+    const label = document.getElementById('mk-label').value.trim();
+    if (!sizeMiB || sizeMiB < 16) { notify('サイズは16MiB以上を指定してください', 'error'); return; }
+    const tableName = table === 'gpt' ? 'GPT' : 'MBR';
+    if (!confirm(sel.disk + ' を ' + tableName + ' で初期化し、' + sizeMiB + ' MiB（' + fstype + '）を作成します。\n' +
+        'ディスクの既存データは失われます。\n\n本当に実行しますか？')) return;
+    if (!confirm('最終確認です。\n' + sel.disk + ' を初期化してよろしいですか？')) return;
+    try {
+        setBusy(true);
+        const res = await fetch('/api/part/create', {method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({disk: sel.disk, fstype: fstype, size_mib: sizeMiB, label: label, table: table})});
         const data = await res.json();
         setBusy(false);
         if (!data.ok) { notify('エラー: ' + (data.error || '失敗'), 'error'); return; }
