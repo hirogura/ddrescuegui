@@ -87,7 +87,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>rsync ファイルコピー</h1>
-    <span class="version">v.1.8.1</span>
+    <span class="version">v.1.8.2</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
@@ -373,21 +373,44 @@ function setMountMsg(side, ok, text) {
     el.textContent = text;
 }
 
+async function postMount(side, path, force) {
+    const res = await fetch('/api/rsync/mount', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({side, path, force: !!force}),
+    });
+    return res.json();
+}
+
+async function handleNeedForce(side, path, data) {
+    const detail = data.detail ? '\n理由: ' + data.detail : '';
+    const note = data.force_note ? '\n' + data.force_note : '';
+    const mode = side === 'src'
+        ? 'コピー元は読み取り専用(ro,force)で載せます。'
+        : 'コピー先は書き込み可(rw,force)で載せます。';
+    const msg = 'NTFSがダーティ（要chkdsk）のため通常マウントできません。' + detail + note +
+        '\n' + mode +
+        '\nntfsfixでダーティフラグを削除して強制マウントしますか？' +
+        '\n※ディスクへの書き込みが発生します。本来はWindowsで chkdsk /f が推奨です。';
+    if (!confirm(msg)) return null;
+    return postMount(side, path, true);
+}
+
 async function mountSrcDevice() {
     const sel = document.getElementById('source');
     showPartInfo('source');
     if (!sel.value) return;
     setMountMsg('src', true, 'マウント中...');
     try {
-        const res = await fetch('/api/rsync/mount', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({side: 'src', path: sel.value}),
-        });
-        const data = await res.json();
+        let data = await postMount('src', sel.value, false);
+        if (!data.ok && data.need_force) {
+            const retried = await handleNeedForce('src', sel.value, data);
+            if (retried) data = retried;
+            else { setMountMsg('src', false, 'エラー: ' + (data.error || 'マウント失敗')); return; }
+        }
         if (!data.ok) { setMountMsg('src', false, 'エラー: ' + (data.error || 'マウント失敗')); notify('エラー: ' + (data.error || 'マウント失敗'), 'error'); return; }
         srcMount = data.mountpoint;
-        setMountMsg('src', true, 'マウント: ' + data.mountpoint + (data.already_mounted ? '（マウント済みを再利用）' : ''));
+        setMountMsg('src', true, 'マウント: ' + data.mountpoint + (data.already_mounted ? '（マウント済みを再利用）' : '') + (data.forced ? '（NTFS強制マウント）' : ''));
         document.getElementById('src-base').value = data.mountpoint;
         const imgSel = document.getElementById('src-img-part');
         imgSel.style.display = 'none';
@@ -459,15 +482,15 @@ async function mountDstDevice() {
     if (!sel.value) return;
     setMountMsg('dst', true, 'マウント中...');
     try {
-        const res = await fetch('/api/rsync/mount', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({side: 'dst', path: sel.value}),
-        });
-        const data = await res.json();
+        let data = await postMount('dst', sel.value, false);
+        if (!data.ok && data.need_force) {
+            const retried = await handleNeedForce('dst', sel.value, data);
+            if (retried) data = retried;
+            else { setMountMsg('dst', false, 'エラー: ' + (data.error || 'マウント失敗')); return; }
+        }
         if (!data.ok) { setMountMsg('dst', false, 'エラー: ' + (data.error || 'マウント失敗')); notify('エラー: ' + (data.error || 'マウント失敗'), 'error'); return; }
         dstMount = data.mountpoint;
-        setMountMsg('dst', true, 'マウント: ' + data.mountpoint + (data.already_mounted ? '（マウント済みを再利用）' : ''));
+        setMountMsg('dst', true, 'マウント: ' + data.mountpoint + (data.already_mounted ? '（マウント済みを再利用）' : '') + (data.forced ? '（NTFS強制マウント）' : ''));
         if (!document.getElementById('dst-base').value) {
             document.getElementById('dst-base').value = data.mountpoint;
         }

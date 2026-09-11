@@ -12,7 +12,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -970,7 +970,47 @@ def get_dev_mountpoint(path):
     return ""
 
 
-def mount_rsync_device(side, path):
+def _get_blk_fstype(path):
+    """blkid でファイルシステム種別を取得する（取得失敗時は空文字）"""
+    try:
+        r = subprocess.run(["blkid", "-o", "value", "-s", "TYPE", path],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return ((r.stdout or "").strip().split("\n")[0] or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_ntfs_dirty(path):
+    """NTFSダーティ（要chkdsk）かを判定する。理由文も返す"""
+    short = os.path.basename((path or "").strip())
+    # 直近の dmesg に dirty + force の記録があるか確認する
+    try:
+        r = subprocess.run(["dmesg", "--ctime"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            tail = (r.stdout or "")[-8192:].lower()
+            if ("dirty" in tail and "force" in tail) or "scheduled for check" in tail:
+                # デバイス名が含まれていれば確度が高い。含まれなくても NTFS なら疑う
+                if not short or short.lower() in tail or "ntfs" in tail:
+                    return True, "dmesg に NTFSダーティ（volume is dirty）の記録があります"
+    except Exception:
+        pass
+    # ntfsresize --info はダーティ時に「Volume is scheduled for check」で失敗する
+    try:
+        r = subprocess.run(["ntfsresize", "--info", path],
+            capture_output=True, text=True, timeout=30)
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        if "scheduled for check" in out or "volume is dirty" in out:
+            return True, "NTFSボリュームはチェック待ち（要 chkdsk）の状態です"
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return False, ""
+
+
+def mount_rsync_device(side, path, force=False):
     """パーティション等をマウント（済みなら再利用）し、マウントポイントを返す"""
     if side not in ("src", "dst"):
         return {"ok": False, "error": "side が不正です"}
@@ -1014,12 +1054,42 @@ def mount_rsync_device(side, path):
         cmd = ["mount", "-o", "ro", path, base]
     else:
         cmd = ["mount", path, base]
+    # 強制マウント指定時は NTFS のみ対象とし、ntfsfix でダーティをクリアしてから force 付きで載せる
+    ntfsfix_out = ""
+    if force:
+        fstype = _get_blk_fstype(path).lower()
+        if "ntfs" not in fstype:
+            return {"ok": False, "error": f"強制マウントは NTFS のみ対応です（現在: {fstype or '不明'}）"}
+        try:
+            rf = subprocess.run(["ntfsfix", path],
+                capture_output=True, text=True, timeout=60)
+            ntfsfix_out = ((rf.stdout or "") + (rf.stderr or "")).strip()[:500]
+        except FileNotFoundError:
+            return {"ok": False, "error": "ntfsfix が見つかりません（ntfs-3g を導入してください）"}
+        except Exception as e:
+            return {"ok": False, "error": f"ntfsfix 実行エラー: {e}"}
+        # コピー元は読み取り専用を維持し、コピー先は書き込み可で載せる
+        if side == "src":
+            cmd = ["mount", "-o", "ro,force", path, base]
+        else:
+            cmd = ["mount", "-o", "rw,force", path, base]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except Exception as e:
         return {"ok": False, "error": f"マウント実行エラー: {e}"}
     if r.returncode != 0:
         err = ((r.stderr or r.stdout) or "").strip().split("\n")[0][:300]
+        # NTFSダーティ時は強制マウントの選択肢を返す（フロントで確認表示用）
+        if not force:
+            fstype = _get_blk_fstype(path).lower()
+            if "ntfs" in fstype:
+                dirty, reason = _is_ntfs_dirty(path)
+                if dirty or ("ntfs" in err.lower() or "dirty" in err.lower()):
+                    detail = reason or "NTFSボリュームがダーティ（要 chkdsk）の可能性があります"
+                    mode_note = "コピー元は読み取り専用を維持" if side == "src" else "コピー先は書き込み可"
+                    return {"ok": False, "error": f"マウント失敗: {err}",
+                        "need_force": True, "fstype": "ntfs", "detail": detail,
+                        "force_note": f"ntfsfix でダーティフラグをクリアして強制マウントできます（{mode_note}）。本来は Windows で chkdsk /f が推奨です"}
         # コピー元 ro 失敗時は NTFS のダーティ等が多いためヒント付きで返す
         hint = ""
         if side == "src" and ("ntfs" in err.lower() or "dirty" in err.lower() or "windows" in err.lower()):
@@ -1029,7 +1099,12 @@ def mount_rsync_device(side, path):
         "own_mount": True, "mounted_at": time.time()}
     mounts[side] = info
     _save_rsync_mounts(mounts)
-    return {"ok": True, "mountpoint": base, "already_mounted": False, "info": info}
+    res = {"ok": True, "mountpoint": base, "already_mounted": False, "info": info}
+    if force:
+        res["forced"] = True
+        if ntfsfix_out:
+            res["ntfsfix"] = ntfsfix_out
+    return res
 
 
 def _losetup_detach(loopdev):
@@ -3205,7 +3280,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json({"error": "side が不正です"}); return
         if not path:
             self._json({"error": "デバイスを指定してください"}); return
-        res = mount_rsync_device(side, path)
+        force = bool(data.get("force"))
+        res = mount_rsync_device(side, path, force=force)
         self._json(res, 200 if res.get("ok") else 400)
 
     def _handle_rsync_mount_image(self, data):
