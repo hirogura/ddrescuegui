@@ -16,7 +16,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f
 .btn-header:hover{background:#475569}
 .btn-header:disabled{opacity:0.5;cursor:not-allowed}
 .header .port{color:#64748b;font-size:0.85em}
-.main{max-width:1200px;margin:0 auto;padding:24px}
+.main{max-width:1700px;margin:0 auto;padding:24px}
 .card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:20px}
 .card h2{font-size:1.1em;color:#38bdf8;margin-bottom:12px;display:flex;align-items:center;gap:8px}
 .card h2 .btn-header{margin-left:auto;font-size:0.78em;padding:5px 12px}
@@ -179,6 +179,7 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
                 <input type="text" id="dst-base" placeholder="/mnt/ddrescuegui-rsync/dst/...">
                 <div class="help-text">存在しない場合は自動作成されます（マウント内に限る）</div>
                 <div class="inline-row">
+                    <button class="btn btn-info" onclick="loadDstList()">一覧表示</button>
                     <button class="btn btn-secondary" onclick="mkdirDst()">フォルダ作成</button>
                 </div>
                 <div id="dst-exist-msg"></div>
@@ -187,15 +188,31 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
     </div>
 
     <div class="card">
-        <h2>コピーするフォルダ・ファイルの選択</h2>
-        <div class="file-list-header">
-            <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em" onclick="checkAll(true)">全チェック</button>
-            <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em" onclick="checkAll(false)">全Off</button>
-            <button class="btn btn-info" style="padding:6px 14px;font-size:0.85em" onclick="loadList()">更新</button>
-            <span class="count" id="file-count"></span>
-        </div>
-        <div class="file-list" id="file-list">
-            <div class="file-row"><span class="name" style="color:#64748b">コピー元フォルダを指定して「一覧表示」を押してください</span></div>
+        <h2>フォルダ・ファイルの確認</h2>
+        <div class="info-panel" style="margin-top:0">
+            <div class="side-section">
+                <h3>コピーするフォルダ・ファイルの選択</h3>
+                <div class="file-list-header">
+                    <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em" onclick="checkAll(true)">全チェック</button>
+                    <button class="btn btn-secondary" style="padding:6px 14px;font-size:0.85em" onclick="checkAll(false)">全Off</button>
+                    <button class="btn btn-info" style="padding:6px 14px;font-size:0.85em" onclick="loadList()">更新</button>
+                    <span class="count" id="file-count"></span>
+                </div>
+                <div class="file-list" id="file-list">
+                    <div class="file-row"><span class="name" style="color:#64748b">コピー元フォルダを指定して「一覧表示」を押してください</span></div>
+                </div>
+            </div>
+            <div class="side-section">
+                <h3>コピー先フォルダの確認</h3>
+                <div class="help-text">コピー先フォルダが正しいか確認するための表示です（チェック不要・選択には使いません）。</div>
+                <div class="file-list-header" style="margin-top:10px">
+                    <button class="btn btn-info" style="padding:6px 14px;font-size:0.85em" onclick="loadDstList()">更新</button>
+                    <span class="count" id="dst-file-count"></span>
+                </div>
+                <div class="file-list" id="dst-file-list">
+                    <div class="file-row"><span class="name" style="color:#64748b">コピー先フォルダを指定して「一覧表示」を押してください</span></div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -615,6 +632,50 @@ async function loadList() {
             row.addEventListener('click', ev => {
                 if (ev.target !== cb) cb.checked = !cb.checked;
             });
+            listEl.appendChild(row);
+        });
+    } catch(e) {
+        listEl.innerHTML = '<div class="file-row"><span class="name" style="color:#f87171">通信エラー</span></div>';
+    }
+}
+
+async function loadDstList() {
+    const base = document.getElementById('dst-base').value.trim();
+    const listEl = document.getElementById('dst-file-list');
+    if (!base) { notify('コピー先フォルダを指定してください', 'error'); return; }
+    listEl.innerHTML = '<div class="file-row"><span class="name" style="color:#64748b">読み込み中...</span></div>';
+    try {
+        const res = await fetch('/api/rsync/list?side=dst&base=' + encodeURIComponent(base));
+        const data = await res.json();
+        if (!data.ok) {
+            listEl.innerHTML = '<div class="file-row"><span class="name" style="color:#f87171">' + esc(data.error || '取得失敗') + '</span></div>';
+            document.getElementById('dst-file-count').textContent = '';
+            notify('エラー: ' + (data.error || '取得失敗'), 'error');
+            return;
+        }
+        const entries = data.entries || [];
+        document.getElementById('dst-file-count').textContent =
+            entries.length + ' 件' + (data.truncated ? '（上限2000件まで表示）' : '');
+        if (!entries.length) {
+            listEl.innerHTML = '<div class="file-row"><span class="name" style="color:#64748b">フォルダ内は空です</span></div>';
+            return;
+        }
+        listEl.innerHTML = '';
+        entries.forEach(e => {
+            const row = document.createElement('div');
+            row.className = 'file-row';
+            const tag = document.createElement('span');
+            tag.className = 'tag' + (e.type === 'dir' ? ' dir' : (e.type === 'link' ? ' link' : ''));
+            tag.textContent = e.type === 'dir' ? 'フォルダ' : (e.type === 'file' ? 'ファイル' : e.type);
+            const name = document.createElement('span');
+            name.className = 'name';
+            name.textContent = e.name;
+            const meta = document.createElement('span');
+            meta.className = 'meta';
+            meta.textContent = (e.type === 'dir' ? '' : e.size_h + ' ｜ ') + (e.mtime || '');
+            row.appendChild(tag);
+            row.appendChild(name);
+            row.appendChild(meta);
             listEl.appendChild(row);
         });
     } catch(e) {
