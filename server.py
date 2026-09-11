@@ -12,7 +12,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -1937,6 +1937,61 @@ def part_mklabel(disk, table_type):
     return {"ok": True, "message": f"{disk} を {name} で初期化しました"}
 
 
+def part_dellabel(disk):
+    """パーティションテーブルだけのドライブからテーブルを削除する（未初期化に戻す）
+    パーティションが1つでもある場合や全体FSがある場合は拒否する"""
+    disk = (disk or "").strip()
+    if not WIPE_PATH_RE.match(disk):
+        return {"ok": False, "error": f"不正なデバイス指定です: {disk}"}
+    d, err = _part_guard(disk, for_create_disk=True)
+    if err:
+        return {"ok": False, "error": err}
+    # マウント中（ディスク配下のいずれか）・swap使用中は拒否
+    mounts = get_disk_mountpoints(disk)
+    if mounts:
+        dev, mp = mounts[0]
+        return {"ok": False, "error": f"{dev} はマウント中（{mp}）のため削除できません（先にアンマウントしてください）"}
+    try:
+        r = subprocess.run(["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE", disk],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "{}")
+        devs = data.get("blockdevices", [])
+        if devs:
+            top = devs[0]
+            if (top.get("fstype") or "").strip():
+                return {"ok": False, "error": f"{disk} 全体にファイルシステムがあるため削除できません"}
+            if top.get("children"):
+                return {"ok": False, "error": f"{disk} にはパーティションがあるためテーブルを削除できません（先にパーティションを削除してください）"}
+    except Exception as e:
+        return {"ok": False, "error": f"ディスク状態の確認に失敗しました: {e}"}
+    # テーブル種別の確認（未初期化なら削除対象なし）
+    table, _, _ = _parted_parse_free(disk)
+    if table in ("", "unknown"):
+        return {"ok": False, "error": f"{disk} にパーティションテーブルがありません"}
+    # 署名を除去し、先頭・末尾（GPTバックアップ対策）をゼロクリアする
+    rc, out = _run_cmd(["wipefs", "-a", disk], timeout=60)
+    if rc != 0:
+        return {"ok": False, "error": f"署名の削除に失敗しました: {out[:300]}"}
+    size_bytes = get_device_size_bytes(disk)
+    # 先頭 2MiB をゼロクリア（MBR/GPTヘッダ）
+    rc, out = _run_cmd(["dd", "if=/dev/zero", f"of={disk}",
+        "bs=1M", "count=2", "conv=fsync"], timeout=300)
+    if rc != 0:
+        return {"ok": False, "error": f"テーブルの削除に失敗しました: {out[:300]}"}
+    # GPTバックアップ（末尾）対策：ディスク末尾 2MiB をゼロクリア
+    if size_bytes and size_bytes > 4 * MIB:
+        try:
+            skip_mb = size_bytes // MIB - 2
+            rc, out = _run_cmd(["dd", "if=/dev/zero", f"of={disk}",
+                "bs=1M", f"seek={skip_mb}", "count=2", "conv=fsync"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"テーブルの削除に失敗しました（末尾）: {out[:300]}"}
+        except Exception as e:
+            return {"ok": False, "error": f"末尾のクリアに失敗しました: {e}"}
+    _part_refresh(disk)
+    return {"ok": True, "message": f"{disk} のパーティションテーブルを削除しました"}
+
+
 def part_delete(part):
     """パーティション削除。マウント中・システムは拒否"""
     part = (part or "").strip()
@@ -2734,6 +2789,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/part/delete": self._handle_part_delete(data)
         elif p.path == "/api/part/create": self._handle_part_create(data)
         elif p.path == "/api/part/mklabel": self._handle_part_mklabel(data)
+        elif p.path == "/api/part/dellabel": self._handle_part_dellabel(data)
         elif p.path == "/api/part/resize": self._handle_part_resize(data)
         else: self._json({"error": "not found"}, 404)
 
@@ -3312,6 +3368,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not disk:
             self._json({"error": "対象ディスクを指定してください"}); return
         res = part_mklabel(disk, table_type)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_part_dellabel(self, data):
+        err = self._part_busy_guard()
+        if err:
+            self._json({"error": err}); return
+        disk = (data.get("disk") or "").strip()
+        if not disk:
+            self._json({"error": "対象ディスクを指定してください"}); return
+        res = part_dellabel(disk)
         self._json(res, 200 if res.get("ok") else 400)
 
     def _handle_part_resize(self, data):

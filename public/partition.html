@@ -72,7 +72,7 @@ input[type=range]{width:100%;accent-color:#38bdf8}
 <body>
 <div class="header">
     <h1>パーティション操作</h1>
-    <span class="version">v.1.8.3</span>
+    <span class="version">v.1.8.4</span>
     <div class="header-actions">
         <button class="btn-header" onclick="location.href='/'">レスキューに戻る</button>
         <button class="btn-header" onclick="loadAll()">リフレッシュ</button>
@@ -401,6 +401,10 @@ function renderOp() {
     } else {
         const f = sel.free;
         const freeMiB = fmtMiB(f.size_bytes);
+        // パーティションテーブルだけのドライブ（パーティション数0・テーブルあり）は
+        // テーブル削除ボタンを作成ボタンの右に表示する
+        const isTableOnly = d && ((d.partitions || []).length === 0) && !d.needs_init &&
+            d.table && d.table !== '不明';
         body.innerHTML =
             '<div class="op-info"><b>' + esc(sel.disk) + '</b> 上の空き領域（' + esc(f.size) + '）に新規パーティションを作成します。</div>' +
             '<div class="form-group"><label>ファイルシステム</label>' +
@@ -412,7 +416,9 @@ function renderOp() {
             '<input type="number" id="mk-size-num" value="' + freeMiB + '" min="16" max="' + freeMiB + '" oninput="document.getElementById(\'mk-size\').value=this.value"></div>' +
             '<div class="form-group"><label>ラベル（任意）</label><input type="text" id="mk-label" placeholder="例: data" maxlength="32">' +
             '<div class="help-text">vfat は11文字まで（自動で大文字化）。空欄可。</div></div>' +
-            '<div class="btn-group"><button class="btn btn-primary" onclick="doCreate()" ' + (busy ? 'disabled' : '') + '>パーティションを作成</button></div>';
+            '<div class="btn-group"><button class="btn btn-primary" onclick="doCreate()" ' + (busy ? 'disabled' : '') + '>パーティションを作成</button>' +
+            (isTableOnly ? '<button class="btn btn-danger" onclick="doDeleteTable()" ' + (busy ? 'disabled' : '') + '>パーティションテーブルを削除</button>' : '') + '</div>' +
+            (isTableOnly ? '<div class="note">※ パーティションが無いため、不要であればパーティションテーブル自体を削除して未初期化に戻せます。</div>' : '');
     }
 }
 
@@ -469,6 +475,26 @@ async function doCreate() {
         const data = await res.json();
         setBusy(false);
         if (!data.ok) { notify('エラー: ' + (data.error || '失敗'), 'error'); return; }
+        notify(data.message, 'success');
+        sel = null;
+        await loadDevices();
+    } catch(e) { setBusy(false); notify('通信エラー: ' + e.message, 'error'); }
+}
+
+async function doDeleteTable() {
+    if (!sel || sel.kind !== 'free') return;
+    const d = devices.find(x => x.path === sel.disk);
+    const tableName = d && d.table ? d.table.toUpperCase() : 'パーティションテーブル';
+    if (!confirm(sel.disk + ' の' + tableName + 'パーティションテーブルを削除します。\n' +
+        'ディスクは未初期化状態に戻ります。\n\n本当に実行しますか？')) return;
+    if (!confirm('最終確認です。\n' + sel.disk + ' のテーブルを削除してよろしいですか？')) return;
+    try {
+        setBusy(true);
+        const res = await fetch('/api/part/dellabel', {method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({disk: sel.disk})});
+        const data = await res.json();
+        setBusy(false);
+        if (!data.ok) { notify('エラー: ' + (data.error || data.message || '失敗'), 'error'); return; }
         notify(data.message, 'success');
         sel = null;
         await loadDevices();
