@@ -80,9 +80,10 @@ select:focus,input:focus{outline:none;border-color:#38bdf8}
 <body>
 <div class="header">
     <h1>ddrescueGUI</h1>
-    <span id="version" class="version">v.1.7.0</span>
+    <span id="version" class="version">v.1.8.0</span>
     <span class="port">Port 3327</span>
     <div class="header-actions">
+        <button class="btn-header" id="btn-part" onclick="window.open('/partition.html','_blank')" style="background:#155e75">パーティション操作</button>
         <button class="btn-header" id="btn-rsync" onclick="window.open('/rsync.html','_blank')" style="background:#0e7490">rsync</button>
         <button class="btn-header" id="btn-clone" onclick="openClonezilla()" style="background:#166534">Clonezilla</button>
         <button class="btn-header" id="btn-smart" onclick="window.open('/smart.html','_blank')" style="background:#0e7490">S.M.A.R.T.情報</button>

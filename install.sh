@@ -30,13 +30,13 @@ fi
 
 install_deps_debian() {
     apt-get update -qq
-    apt-get install -y -qq python3 gddrescue smartmontools fdisk git clonezilla partclone rsync
+    apt-get install -y -qq python3 gddrescue smartmontools fdisk git clonezilla partclone rsync parted dosfstools ntfs-3g exfatprogs xfsprogs btrfs-progs e2fsprogs
 }
 
 install_deps_arch() {
     # CachyOS / Arch 系のパッケージ名に読み替える
     #   gddrescue -> ddrescue, fdisk -> util-linux (lsblk/blkid/fdisk 同梱), file 追加
-    pacman -Sy --noconfirm --needed python ddrescue smartmontools util-linux file git clonezilla partclone rsync
+    pacman -Sy --noconfirm --needed python ddrescue smartmontools util-linux file git clonezilla partclone rsync parted dosfstools ntfs-3g exfatprogs xfsprogs btrfs-progs e2fsprogs
 }
 
 if [ -n "$(echo " $OS_LIKE " | grep -i " arch ")" ] || [ "$OS_ID" = "arch" ] || [ "$OS_ID" = "cachyos" ]; then
@@ -51,7 +51,7 @@ elif [ "$OS_ID" = "debian" ] || [ "$OS_ID" = "ubuntu" ] || command -v apt-get >/
     install_deps_debian
 else
     echo "Error: Unsupported distribution (ID=${OS_ID} LIKE=${OS_LIKE})." >&2
-     echo "Please install manually: python3, ddrescue(gddrescue), smartmontools, fdisk(util-linux), git, clonezilla, partclone, rsync" >&2
+     echo "Please install manually: python3, ddrescue(gddrescue), smartmontools, fdisk(util-linux), git, clonezilla, partclone, rsync, parted" >&2
     exit 1
 fi
 

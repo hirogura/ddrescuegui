@@ -12,7 +12,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -1531,6 +1531,581 @@ def get_rsync_progress():
         "elapsed_sec": elapsed, "log_file": job.get("log_file", "")}
 
 
+# ---- パーティション操作用ヘルパー ----
+# KDEパーティションマネージャ相当の表示＋拡縮小/作成/削除を提供する。
+# parted を中核に使い、ファイルシステム側のリサイズは対応FSのみ行う。
+PART_DEV_RE = re.compile(r"^/dev/(sd[a-z]+\d*|hd[a-z]+\d*|vd[a-z]+\d*|nvme\d+n\d+p?\d*|mmcblk\d+p?\d*)$")
+part_install_running = False
+part_install_lock = threading.Lock()
+MIB = 1024 * 1024
+
+
+def get_part_tools():
+    """パーティション操作に必要なツールの導入状態を返す"""
+    tools = {}
+    for name in ("parted", "sfdisk", "wipefs", "partprobe",
+                 "e2fsck", "resize2fs", "ntfsresize", "fatresize",
+                 "xfs_growfs", "btrfs",
+                 "mkfs.ext4", "mkfs.vfat", "mkfs.ntfs", "mkfs.xfs",
+                 "mkfs.exfat", "mkfs.btrfs"):
+        tools[name] = shutil.which(name) is not None
+    with part_install_lock:
+        installing = part_install_running
+    # 必須は parted のみ。FS系は対応FSを使う場合に個別チェックする
+    return {"installed": bool(tools.get("parted")), "installing": installing,
+        "tools": tools, "system_disk": get_system_disk()}
+
+
+def _run_cmd(cmd, timeout=120):
+    """コマンドを実行し (rc, 出力) を返す"""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    except FileNotFoundError:
+        return 127, f"コマンドが見つかりません: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "コマンドがタイムアウトしました"
+
+
+def _part_parent_disk(part):
+    """パーティション → 親ディスク名（/dev/xxx）を返す。失敗時は空文字"""
+    try:
+        r = subprocess.run(["lsblk", "-n", "-o", "PKNAME", part],
+            capture_output=True, text=True, timeout=5)
+        parent = (r.stdout or "").strip().split("\n")[0].strip()
+        if parent:
+            return f"/dev/{parent}"
+    except Exception:
+        pass
+    return ""
+
+
+def _part_number(disk, part):
+    """パーティション番号を返す（/sys優先、parted表示で補完）。失敗時はNone"""
+    disk_base = os.path.basename(disk)
+    part_base = os.path.basename(part)
+    try:
+        with open(f"/sys/block/{disk_base}/{part_base}/partition", "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        pass
+    # フォールバック：nvme0n1p2 / mmcblk0p1 / sda12 の末尾数字
+    try:
+        base = os.path.basename(disk)
+        suffix = part_base[len(base):] if part_base.startswith(base) else part_base
+        suffix = suffix.lstrip("p")
+        if suffix.isdigit():
+            return int(suffix)
+    except Exception:
+        pass
+    return None
+
+
+def _parted_parse_free(disk):
+    """parted の print free を解析し (テーブル種別, パーティション番号→(start,end), 空き一覧) を返す"""
+    table = ""
+    bounds = {}
+    frees = []
+    rc, out = _run_cmd(["parted", "-s", disk, "unit", "B", "print", "free"], timeout=30)
+    if rc != 0:
+        return table, bounds, frees
+    for line in out.split("\n"):
+        s = line.strip()
+        low = s.lower()
+        # パーティションテーブル種別（日英両対応）
+        if "パーティションテーブル" in s or "partition table" in low:
+            if "gpt" in low:
+                table = "gpt"
+            elif "msdos" in low or "mbr" in low:
+                table = "msdos"
+            else:
+                table = s.split(":")[-1].strip()
+            continue
+        # 空き領域行（番号なし・先頭がバイト数）
+        m_free = re.match(r"^(\d+)B\s+(\d+)B\s+(\d+)B\s+.*(?:空き|free)", s, re.I)
+        if m_free and not re.match(r"^\d+\s", s):
+            try:
+                frees.append({"start_bytes": int(m_free.group(1)),
+                    "end_bytes": int(m_free.group(2)),
+                    "size_bytes": int(m_free.group(3))})
+            except Exception:
+                pass
+            continue
+        # パーティション行（先頭が番号）
+        m_part = re.match(r"^(\d+)\s+(\d+)B\s+(\d+)B\s+(\d+)B", s)
+        if m_part:
+            try:
+                bounds[int(m_part.group(1))] = (int(m_part.group(2)), int(m_part.group(3)))
+            except Exception:
+                pass
+    return table, bounds, frees
+
+
+def get_part_devices():
+    """パーティション操作ページ用：ディスク＋パーティション（使用量）＋空き領域の一覧"""
+    devices = []
+    try:
+        r = subprocess.run(
+            ["lsblk", "-J", "-b", "-o",
+             "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,PARTLABEL,PARTTYPE,PARTUUID,"
+             "FSUSED,FSAVAIL,FSUSE%,MODEL,SERIAL,TRAN,PARTTYPE"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return []
+        data = json.loads(r.stdout or "{}")
+    except Exception:
+        return []
+    sys_disk = get_system_disk()
+    for dev in data.get("blockdevices", []) or []:
+        if dev.get("type") != "disk":
+            continue
+        name = dev.get("name", "")
+        disk = f"/dev/{name}"
+        if not WIPE_PATH_RE.match(disk):
+            continue
+        size_bytes = int(dev.get("size", 0) or 0)
+        model = (dev.get("model") or "").strip()
+        serial = (dev.get("serial") or "").strip()
+        tran = (dev.get("tran") or "").strip()
+        table, bounds, frees = _parted_parse_free(disk)
+        partitions = []
+        has_mount = bool(dev.get("mountpoint"))
+        for child in dev.get("children") or []:
+            if (child.get("type") or "") not in ("part", "raid", "lvm"):
+                # ディスク直下の part 以外（暗号化マッパー等）は表示のみ対象外
+                if (child.get("type") or "") != "part":
+                    continue
+            cname = child.get("name", "")
+            cpath = f"/dev/{cname}"
+            if not PART_DEV_RE.match(cpath):
+                continue
+            csize = int(child.get("size", 0) or 0)
+            cmount = child.get("mountpoint") or ""
+            if cmount:
+                has_mount = True
+            try:
+                used = int(child.get("fsused", 0) or 0)
+            except Exception:
+                used = 0
+            try:
+                avail = int(child.get("fsavail", 0) or 0)
+            except Exception:
+                avail = 0
+            use_pct = (child.get("fsuse%") or "").strip()
+            num = _part_number(disk, cpath)
+            start_b, end_b = bounds.get(num, (0, 0)) if num else (0, 0)
+            partitions.append({
+                "name": cname, "path": cpath, "number": num,
+                "start_bytes": start_b, "end_bytes": end_b,
+                "size_bytes": csize, "size": _fmt_bytes(csize),
+                "fstype": (child.get("fstype") or "").strip(),
+                "label": (child.get("label") or "").strip(),
+                "uuid": (child.get("uuid") or "").strip(),
+                "partlabel": (child.get("partlabel") or "").strip(),
+                "parttype": (child.get("parttype") or "").strip(),
+                "mountpoint": cmount,
+                "used_bytes": used, "used": _fmt_bytes(used) if used else "",
+                "avail_bytes": avail, "avail": _fmt_bytes(avail) if avail else "",
+                "use_percent": use_pct,
+            })
+        # 空き領域に人間可読サイズを付与（1MiB未満の微小ギャップは表示対象外）
+        free_list = []
+        for f in frees:
+            if int(f.get("size_bytes", 0) or 0) < MIB:
+                continue
+            free_list.append({**f, "size": _fmt_bytes(f["size_bytes"])})
+        label = f"/dev/{name} - {_fmt_bytes(size_bytes)}"
+        if model:
+            label += f" ({model})"
+        if serial:
+            label += f" [{serial}]"
+        if tran:
+            label += f" ({tran})"
+        devices.append({"path": disk, "name": name,
+            "size": _fmt_bytes(size_bytes), "size_bytes": size_bytes,
+            "model": model, "serial": serial, "tran": tran, "label": label,
+            "table": table or "不明",
+            "partitions": partitions, "free_spaces": free_list,
+            "has_mount": has_mount, "is_system": (disk == sys_disk)})
+    return devices
+
+
+def _part_refresh(disk):
+    """パーティション変更後のカーネル再読み込み"""
+    _run_cmd(["partprobe", disk], timeout=60)
+    _run_cmd(["udevadm", "settle"], timeout=30)
+    time.sleep(1)
+
+
+def _part_guard(path, for_create_disk=False):
+    """共通ガード：形式・存在・システムドライブ・マウントを検証。NG時はエラー文、OK時は participles(disk)"""
+    disk = path if for_create_disk else _part_parent_disk(path)
+    if not disk:
+        # ディスク指定（作成時）または親解決失敗
+        if for_create_disk:
+            return None, f"デバイスが見つかりません: {path}"
+        return None, f"親ディスクを特定できません: {path}"
+    if not WIPE_PATH_RE.match(disk):
+        return None, f"不正なデバイス指定です: {path}"
+    if not os.path.exists(path if not for_create_disk else disk):
+        return None, f"デバイスが見つかりません: {path}"
+    if disk == get_system_disk():
+        return None, f"{disk} はシステムドライブのため操作できません"
+    if not shutil.which("parted"):
+        return None, "parted が利用できません（先にツールをインストールしてください）"
+    return disk, ""
+
+
+def part_delete(part):
+    """パーティション削除。マウント中・システムは拒否"""
+    part = (part or "").strip()
+    if not PART_DEV_RE.match(part):
+        return {"ok": False, "error": f"不正なデバイス指定です: {part}"}
+    if not os.path.exists(part):
+        return {"ok": False, "error": f"デバイスが見つかりません: {part}"}
+    disk, err = _part_guard(part)
+    if err:
+        return {"ok": False, "error": err}
+    if get_dev_mountpoint(part):
+        return {"ok": False, "error": f"{part} はマウント中のため削除できません（先にアンマウントしてください）"}
+    # swap 有効なパーティションは拒否
+    try:
+        r = subprocess.run(["swapon", "--show=NAME", "--noheadings"],
+            capture_output=True, text=True, timeout=10)
+        if part in (r.stdout or ""):
+            return {"ok": False, "error": f"{part} は swap として使用中のため削除できません（swapoff 後に再試行）"}
+    except Exception:
+        pass
+    num = _part_number(disk, part)
+    if not num:
+        return {"ok": False, "error": f"パーティション番号を特定できません: {part}"}
+    rc, out = _run_cmd(["parted", "-s", disk, "rm", str(num)], timeout=120)
+    if rc != 0:
+        return {"ok": False, "error": f"削除に失敗しました: {out[:300]}"}
+    _run_cmd(["wipefs", "-a", part], timeout=30)
+    _part_refresh(disk)
+    return {"ok": True, "message": f"{part} を削除しました"}
+
+
+# 作成に対応するファイルシステムと mkfs コマンド
+PART_MKFS = {
+    "ext4": ["mkfs.ext4", "-F"],
+    "ntfs": ["mkfs.ntfs", "-f", "-F"],
+    "vfat": ["mkfs.vfat", "-F", "32"],
+    "exfat": ["mkfs.exfat"],
+    "xfs": ["mkfs.xfs", "-f"],
+    "btrfs": ["mkfs.btrfs", "-f"],
+}
+
+
+def part_create(disk, fstype, size_bytes, label="", start_bytes=None):
+    """空き領域にパーティションを作成し、ファイルシステムを初期化する"""
+    disk = (disk or "").strip()
+    fstype = (fstype or "").strip().lower()
+    try:
+        size_bytes = int(size_bytes or 0)
+    except Exception:
+        return {"ok": False, "error": "サイズが不正です"}
+    if not WIPE_PATH_RE.match(disk):
+        return {"ok": False, "error": f"不正なデバイス指定です: {disk}"}
+    d, err = _part_guard(disk, for_create_disk=True)
+    if err:
+        return {"ok": False, "error": err}
+    if fstype not in PART_MKFS:
+        return {"ok": False, "error": f"未対応のファイルシステムです: {fstype}"}
+    mkfs_bin = PART_MKFS[fstype][0]
+    if shutil.which(mkfs_bin) is None:
+        return {"ok": False, "error": f"{mkfs_bin} が利用できません（ツールをインストールしてください）"}
+    label = (label or "").strip()
+    if fstype == "vfat" and len(label) > 11:
+        return {"ok": False, "error": "vfat のラベルは11文字までです"}
+    if size_bytes < 16 * MIB:
+        return {"ok": False, "error": "サイズは 16MiB 以上を指定してください"}
+    # 空き領域の選定（指定開始位置が無ければ収まる最初の領域）
+    _, _, frees = _parted_parse_free(disk)
+    cands = [f for f in frees if int(f.get("size_bytes", 0) or 0) >= size_bytes + MIB]
+    if not cands:
+        return {"ok": False, "error": "指定サイズが収まる空き領域が見つかりません"}
+    chosen = None
+    if start_bytes is not None:
+        try:
+            start_bytes = int(start_bytes)
+        except Exception:
+            return {"ok": False, "error": "開始位置が不正です"}
+        for f in cands:
+            if f["start_bytes"] <= start_bytes and start_bytes + size_bytes <= f["end_bytes"]:
+                chosen = f
+                break
+        if chosen is None:
+            return {"ok": False, "error": "指定の開始位置に十分な空き領域がありません"}
+    else:
+        chosen = cands[0]
+        start_bytes = int(chosen["start_bytes"])
+    # MiB アライメント（開始は切り上げ・終了は切り捨て）
+    start_al = ((start_bytes + MIB - 1) // MIB) * MIB
+    end_al = start_al + size_bytes
+    end_al = (end_al // MIB) * MIB
+    if end_al - start_al < 16 * MIB or end_al > int(chosen["end_bytes"]):
+        return {"ok": False, "error": "アライメント調整後に有効な領域が残りません（サイズを調整してください）"}
+    # GPT ではデータ用パーティション名が必要な場合があるため付与
+    _, bounds_before, _ = _parted_parse_free(disk)
+    rc, out = _run_cmd(["parted", "-s", disk, "mkpart", "primary",
+        f"{start_al}B", f"{end_al}B"], timeout=120)
+    if rc != 0:
+        return {"ok": False, "error": f"パーティション作成に失敗しました: {out[:300]}"}
+    _part_refresh(disk)
+    # 新規パーティションの特定（番号が最大のもの）
+    _, bounds_after, _ = _parted_parse_free(disk)
+    new_nums = set(bounds_after) - set(bounds_before)
+    if not new_nums:
+        # parted が番号を再利用した場合：parted print から末尾を採用
+        new_num = max(bounds_after) if bounds_after else None
+    else:
+        new_num = max(new_nums)
+    if not new_num:
+        return {"ok": False, "error": "作成後のパーティションを特定できませんでした"}
+    new_part = None
+    # lsblk で番号→デバイス名を解決
+    try:
+        r = subprocess.run(["lsblk", "-J", "-o", "NAME,TYPE", disk],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "{}")
+        for dev in data.get("blockdevices", []):
+            for ch in dev.get("children") or []:
+                if _part_number(disk, f"/dev/{ch.get('name', '')}") == new_num:
+                    new_part = f"/dev/{ch.get('name', '')}"
+    except Exception:
+        pass
+    if not new_part:
+        return {"ok": False, "error": "作成後のデバイス名を特定できませんでした"}
+    # ファイルシステム初期化
+    cmd = list(PART_MKFS[fstype])
+    if label:
+        if fstype in ("ext4", "ntfs", "xfs", "exfat", "btrfs"):
+            cmd += ["-L", label]
+        elif fstype == "vfat":
+            cmd += ["-n", label.upper()]
+    cmd.append(new_part)
+    rc, out = _run_cmd(cmd, timeout=600)
+    if rc != 0:
+        return {"ok": False, "error": f"{new_part} のフォーマットに失敗しました: {out[:300]}",
+            "part": new_part}
+    _part_refresh(disk)
+    return {"ok": True, "message": f"{new_part} ({fstype}) を作成しました", "part": new_part}
+
+
+def part_resize(part, new_size_bytes):
+    """パーティションの拡縮小。ext4/ntfs はFS連動、xfs/btrfs は拡大のみ（FS拡張は別途案内）"""
+    part = (part or "").strip()
+    try:
+        new_size_bytes = int(new_size_bytes or 0)
+    except Exception:
+        return {"ok": False, "error": "サイズが不正です"}
+    if not PART_DEV_RE.match(part):
+        return {"ok": False, "error": f"不正なデバイス指定です: {part}"}
+    disk, err = _part_guard(part)
+    if err:
+        return {"ok": False, "error": err}
+    if get_dev_mountpoint(part):
+        return {"ok": False, "error": f"{part} はマウント中のため変更できません（先にアンマウントしてください）"}
+    num = _part_number(disk, part)
+    if not num:
+        return {"ok": False, "error": f"パーティション番号を特定できません: {part}"}
+    # 現在の境界・FS種別・使用量を取得
+    _, bounds, frees = _parted_parse_free(disk)
+    if num not in bounds:
+        return {"ok": False, "error": f"パーティション情報を取得できません: {part}"}
+    start_b, end_b = bounds[num]
+    cur_size = end_b - start_b
+    if new_size_bytes < 16 * MIB:
+        return {"ok": False, "error": "サイズは 16MiB 以上を指定してください"}
+    if abs(new_size_bytes - cur_size) < MIB:
+        return {"ok": False, "error": "サイズに変化がありません（1MiB以上変更してください）"}
+    fstype = ""
+    used_bytes = 0
+    try:
+        r = subprocess.run(["lsblk", "-J", "-b", "-o", "NAME,FSTYPE,FSUSED", part],
+            capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "{}")
+        devs = data.get("blockdevices", [])
+        if devs:
+            fstype = ((devs[0].get("fstype") or "").strip().lower())
+            used_bytes = int(devs[0].get("fsused", 0) or 0)
+    except Exception:
+        pass
+    if new_size_bytes > cur_size:
+        # --- 拡大：後続の空きが連続している必要がある ---
+        new_end = start_b + new_size_bytes
+        ok_gap = any(f["start_bytes"] <= end_b + 1 and new_end <= f["end_bytes"] + 1
+            for f in frees)
+        if not ok_gap:
+            return {"ok": False, "error": "パーティション直後に十分な空き領域がありません（拡大には隣接する空きが必要です）"}
+        new_end_al = (new_end // MIB) * MIB
+        if new_end_al - start_b < cur_size + MIB:
+            return {"ok": False, "error": "アライメント調整後に拡大幅が残りません（サイズを調整してください）"}
+        if fstype in ("", "swap"):
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            return {"ok": True, "message": f"{part} を {_fmt_bytes(new_end_al - start_b)} に拡大しました"}
+        if fstype in ("ext4",):
+            if shutil.which("resize2fs") is None or shutil.which("e2fsck") is None:
+                return {"ok": False, "error": "e2fsck/resize2fs が利用できません"}
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"パーティション拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            rc, out = _run_cmd(["e2fsck", "-f", "-y", part], timeout=600)
+            # e2fsck は修正ありで rc=1 を返すことがあるため 0/1 は許容
+            if rc not in (0, 1):
+                return {"ok": False, "error": f"ファイルシステム検査に失敗しました: {out[:300]}"}
+            rc, out = _run_cmd(["resize2fs", part], timeout=1800)
+            if rc != 0:
+                return {"ok": False, "error": f"ファイルシステム拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            return {"ok": True, "message": f"{part} を拡大しました（ext4連動）"}
+        if fstype in ("ntfs",):
+            if shutil.which("ntfsresize") is None:
+                return {"ok": False, "error": "ntfsresize が利用できません"}
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"パーティション拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            rc, out = _run_cmd(["ntfsresize", "-f", part], timeout=1800)
+            if rc != 0:
+                return {"ok": False, "error": f"NTFS拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            return {"ok": True, "message": f"{part} を拡大しました（NTFS連動）"}
+        if fstype in ("xfs", "btrfs"):
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            grow = "xfs_growfs（マウント後に実行）" if fstype == "xfs" else "btrfs filesystem resize（マウント後に実行）"
+            return {"ok": True, "message": f"{part} のパーティションを拡大しました。FS拡張は別途 {grow} が必要です",
+                "need_fs_grow": True}
+        if fstype in ("vfat", "exfat"):
+            if fstype == "vfat" and shutil.which("fatresize") is None:
+                return {"ok": False, "error": "vfat のリサイズには fatresize が必要です（未導入のため未対応）"}
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"拡大に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            if fstype == "vfat":
+                rc, out = _run_cmd(["fatresize", "-s", f"{(new_end_al - start_b) // MIB}M", part], timeout=1800)
+                if rc != 0:
+                    return {"ok": False, "error": f"FAT拡大に失敗しました: {out[:300]}"}
+            return {"ok": True, "message": f"{part} を拡大しました（{fstype}連動）"}
+        return {"ok": False, "error": f"未対応のファイルシステムです: {fstype or '不明'}"}
+    else:
+        # --- 縮小 ---
+        if used_bytes and new_size_bytes <= int(used_bytes * 1.05) + 64 * MIB:
+            return {"ok": False, "error": f"使用中 ({_fmt_bytes(used_bytes)}) のため指定サイズに縮小できません"}
+        new_end = start_b + new_size_bytes
+        new_end_al = (new_end // MIB) * MIB
+        if new_end_al <= start_b + 16 * MIB:
+            return {"ok": False, "error": "縮小後のサイズが小さすぎます"}
+        if fstype in ("xfs", "btrfs"):
+            return {"ok": False, "error": f"{fstype} の縮小は未対応です（拡大のみ対応）"}
+        if fstype in ("ext4",):
+            if shutil.which("resize2fs") is None or shutil.which("e2fsck") is None:
+                return {"ok": False, "error": "e2fsck/resize2fs が利用できません"}
+            rc, out = _run_cmd(["e2fsck", "-f", "-y", part], timeout=600)
+            if rc not in (0, 1):
+                return {"ok": False, "error": f"ファイルシステム検査に失敗しました: {out[:300]}"}
+            # FSを先に縮小（ブロック単位の切り上げ誤差に備え1MiB余裕を見る）
+            shrink_arg = f"{(new_end_al - start_b) // MIB}M"
+            rc, out = _run_cmd(["resize2fs", part, shrink_arg], timeout=1800)
+            if rc != 0:
+                return {"ok": False, "error": f"ファイルシステム縮小に失敗しました: {out[:300]}"}
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"FSは縮小済みですがパーティション縮小に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            return {"ok": True, "message": f"{part} を縮小しました（ext4連動）"}
+        if fstype in ("ntfs",):
+            if shutil.which("ntfsresize") is None:
+                return {"ok": False, "error": "ntfsresize が利用できません"}
+            shrink_arg = f"{(new_end_al - start_b) // (1024 * 1024)}M"
+            rc, out = _run_cmd(["ntfsresize", "-f", "-s", shrink_arg, part], timeout=1800)
+            if rc != 0:
+                return {"ok": False, "error": f"NTFS縮小に失敗しました: {out[:300]}"}
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"FSは縮小済みですがパーティション縮小に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            return {"ok": True, "message": f"{part} を縮小しました（NTFS連動）"}
+        if fstype in ("vfat",):
+            if shutil.which("fatresize") is None:
+                return {"ok": False, "error": "vfat のリサイズには fatresize が必要です（未導入のため未対応）"}
+            rc, out = _run_cmd(["fatresize", "-s", f"{(new_end_al - start_b) // MIB}M", part], timeout=1800)
+            if rc != 0:
+                return {"ok": False, "error": f"FAT縮小に失敗しました: {out[:300]}"}
+            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            if rc != 0:
+                return {"ok": False, "error": f"FSは縮小済みですがパーティション縮小に失敗しました: {out[:300]}"}
+            _part_refresh(disk)
+            return {"ok": True, "message": f"{part} を縮小しました（vfat連動）"}
+        if fstype in ("", "swap"):
+            if not fstype:
+                rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+                if rc != 0:
+                    return {"ok": False, "error": f"縮小に失敗しました: {out[:300]}"}
+                _part_refresh(disk)
+                return {"ok": True, "message": f"{part} を縮小しました"}
+            return {"ok": False, "error": "swap の縮小は未対応です（削除後に再作成してください）"}
+        return {"ok": False, "error": f"未対応のファイルシステムです: {fstype or '不明'}"}
+
+
+def _run_part_install():
+    """parted＋FS操作ツールをバックグラウンドで導入する"""
+    global part_install_running
+    log_path = os.path.join(LOG_DIR, "part-install.log")
+    try:
+        with open(log_path, "w") as f:
+            f.write(f"=== part tools install started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.flush()
+            os_id, os_like = "", ""
+            try:
+                with open("/etc/os-release") as of:
+                    for line in of:
+                        if line.startswith("ID="):
+                            os_id = line.split("=", 1)[1].strip().strip('"').lower()
+                        elif line.startswith("ID_LIKE="):
+                            os_like = line.split("=", 1)[1].strip().strip('"').lower()
+            except Exception:
+                pass
+            is_arch = ("arch" in os_like) or os_id in ("arch", "cachyos") or \
+                (shutil.which("pacman") and not shutil.which("apt-get"))
+            if is_arch:
+                cmd = ["pacman", "-Sy", "--noconfirm", "--needed",
+                    "parted", "dosfstools", "ntfs-3g", "exfatprogs",
+                    "xfsprogs", "btrfs-progs", "e2fsprogs"]
+            else:
+                f.write("$ apt-get update\n")
+                f.flush()
+                r0 = subprocess.run(["apt-get", "update"], stdout=f, stderr=subprocess.STDOUT, timeout=600)
+                if r0.returncode != 0:
+                    f.write(f"apt-get update failed (code={r0.returncode})\n")
+                cmd = ["apt-get", "install", "-y",
+                    "parted", "dosfstools", "ntfs-3g", "exfatprogs", "exfat-fuse",
+                    "xfsprogs", "btrfs-progs", "e2fsprogs"]
+            f.write(f"$ {' '.join(cmd)}\n")
+            f.flush()
+            r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, timeout=3600)
+            f.write(f"\n=== finished code={r.returncode} ===\n")
+    except Exception as e:
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"install error: {e}\n")
+        except Exception:
+            pass
+    finally:
+        with part_install_lock:
+            part_install_running = False
+
+
 def _split_ocs_image(path):
     """Clonezilla イメージ指定「/dir/NAME」を (ocsroot_dir, image_name) に分割"""
     p = (path or "").strip()
@@ -1909,6 +2484,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self._json(_load_rsync_mounts())
         elif p.path == "/api/rsync/progress":
             self._json(get_rsync_progress())
+        elif p.path == "/api/part/check":
+            self._json(get_part_tools())
+        elif p.path == "/api/part/devices":
+            self._json(get_part_devices())
         else:
             super().do_GET()
 
@@ -1936,6 +2515,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif p.path == "/api/rsync/mkdir": self._handle_rsync_mkdir(data)
         elif p.path == "/api/rsync/start": self._handle_rsync_start(data)
         elif p.path == "/api/rsync/stop": self._handle_stop()
+        elif p.path == "/api/part/install": self._handle_part_install()
+        elif p.path == "/api/part/unmount": self._handle_part_unmount(data)
+        elif p.path == "/api/part/delete": self._handle_part_delete(data)
+        elif p.path == "/api/part/create": self._handle_part_create(data)
+        elif p.path == "/api/part/resize": self._handle_part_resize(data)
         else: self._json({"error": "not found"}, 404)
 
     def do_OPTIONS(self):
@@ -2407,6 +2991,117 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 results.append({"path": path, "ok": True, "unmounted": unmounted})
         self._json({"ok": all_ok, "results": results},
             200 if all_ok else 400)
+
+    def _handle_part_install(self):
+        global part_install_running
+        st = get_part_tools()
+        if st["installed"]:
+            self._json({"ok": True, "already": True}); return
+        with part_install_lock:
+            if part_install_running:
+                self._json({"ok": True, "installing": True}); return
+            part_install_running = True
+        if self._any_running():
+            with part_install_lock:
+                part_install_running = False
+            self._json({"error": "レスキュー／クローン／コピー実行中はインストールできません"}); return
+        if self._wipe_running():
+            with part_install_lock:
+                part_install_running = False
+            self._json({"error": "ディスク消去実行中はインストールできません"}); return
+        th = threading.Thread(target=_run_part_install, daemon=True)
+        th.start()
+        self._json({"ok": True, "installing": True})
+
+    def _handle_part_unmount(self, data):
+        """パーティション単体のマウント解除（swap は swapoff）。システムドライブは保護"""
+        if self._any_running():
+            self._json({"error": "実行中はアンマウントできません"}); return
+        if self._wipe_running():
+            self._json({"error": "ディスク消去実行中はアンマウントできません"}); return
+        part = ((data.get("part") or data.get("path") or "")).strip()
+        if not PART_DEV_RE.match(part):
+            self._json({"error": f"不正なデバイス指定です: {part}"}); return
+        disk = _part_parent_disk(part)
+        if disk == get_system_disk():
+            self._json({"error": f"{part} はシステムドライブのため対象外です"}); return
+        mp = get_dev_mountpoint(part)
+        if not mp:
+            # swap の可能性を確認
+            try:
+                r = subprocess.run(["swapon", "--show=NAME", "--noheadings"],
+                    capture_output=True, text=True, timeout=10)
+                if part in (r.stdout or ""):
+                    r2 = subprocess.run(["swapoff", part],
+                        capture_output=True, text=True, timeout=30)
+                    if r2.returncode == 0:
+                        self._json({"ok": True, "message": f"{part} の swap を無効化しました"}); return
+                    self._json({"error": f"swapoff 失敗: {((r2.stderr or r2.stdout) or '').strip().split(chr(10))[0][:200]}"}); return
+            except Exception:
+                pass
+            self._json({"ok": True, "message": "マウントされていません"}); return
+        if mp.startswith("["):
+            r = subprocess.run(["swapoff", part], capture_output=True, text=True, timeout=30)
+        else:
+            r = subprocess.run(["umount", mp], capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            self._json({"ok": True, "message": f"{mp} をアンマウントしました"}); return
+        self._json({"error": f"アンマウント失敗: {((r.stderr or r.stdout) or '').strip().split(chr(10))[0][:200]}"})
+
+    def _part_busy_guard(self):
+        if self._any_running():
+            return "レスキュー／クローン／コピー実行中はパーティション操作できません"
+        if self._wipe_running():
+            return "ディスク消去実行中はパーティション操作できません"
+        return ""
+
+    def _handle_part_delete(self, data):
+        err = self._part_busy_guard()
+        if err:
+            self._json({"error": err}); return
+        part = ((data.get("part") or data.get("path") or "")).strip()
+        if not part:
+            self._json({"error": "パーティションを指定してください"}); return
+        res = part_delete(part)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_part_create(self, data):
+        err = self._part_busy_guard()
+        if err:
+            self._json({"error": err}); return
+        disk = (data.get("disk") or "").strip()
+        fstype = (data.get("fstype") or "").strip()
+        label = (data.get("label") or "").strip()
+        if not disk:
+            self._json({"error": "対象ディスクを指定してください"}); return
+        if not fstype:
+            self._json({"error": "ファイルシステムを指定してください"}); return
+        # サイズは MiB または バイトのいずれかで受け付ける
+        size_bytes = data.get("size_bytes")
+        if size_bytes is None and data.get("size_mib") is not None:
+            try:
+                size_bytes = int(float(data.get("size_mib")) * MIB)
+            except Exception:
+                size_bytes = 0
+        start_bytes = data.get("start_bytes")
+        res = part_create(disk, fstype, size_bytes, label, start_bytes)
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_part_resize(self, data):
+        err = self._part_busy_guard()
+        if err:
+            self._json({"error": err}); return
+        part = ((data.get("part") or data.get("path") or "")).strip()
+        if not part:
+            self._json({"error": "パーティションを指定してください"}); return
+        new_size = data.get("new_size_bytes")
+        if new_size is None and data.get("new_size_mib") is not None:
+            try:
+                new_size = int(float(data.get("new_size_mib")) * MIB)
+            except Exception:
+                new_size = 0
+        res = part_resize(part, new_size)
+        self._json(res, 200 if res.get("ok") else 400)
 
     def _handle_rsync_install(self):
         global rsync_install_running
