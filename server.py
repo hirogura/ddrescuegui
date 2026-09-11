@@ -12,7 +12,7 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 PORT = 3327
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -1556,15 +1556,78 @@ def get_part_tools():
         "tools": tools, "system_disk": get_system_disk()}
 
 
-def _run_cmd(cmd, timeout=120):
-    """コマンドを実行し (rc, 出力) を返す"""
+def _run_cmd(cmd, timeout=120, input_text=None):
+    """コマンドを実行し (rc, 出力) を返す。input_text 指定時は標準入力に渡す"""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, input=input_text,
+            capture_output=True, text=True, timeout=timeout)
         return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
     except FileNotFoundError:
         return 127, f"コマンドが見つかりません: {cmd[0]}"
     except subprocess.TimeoutExpired:
         return 124, "コマンドがタイムアウトしました"
+
+
+def _parted_resizepart(disk, num, end_bytes):
+    """parted resizepart を実行する。縮小時は確認プロンプト
+    （「それでも実行しますか？」）が -s 指定でも出て失敗するため、
+    ---pretend-input-tty＋Yes応答で無人化する"""
+    cur_end = None
+    try:
+        _, bounds, _ = _parted_parse_free(disk)
+        if num in bounds:
+            cur_end = bounds[num][1]
+    except Exception:
+        pass
+    end_s = f"{int(end_bytes)}B"
+    if cur_end is not None and int(end_bytes) < cur_end:
+        # 縮小：プロンプトに Yes を自動応答させる（有限回。不足時は EOF で安全に中断）
+        return _run_cmd(["parted", "---pretend-input-tty", disk,
+            "resizepart", str(num), end_s],
+            timeout=300, input_text="Yes\n" * 8)
+    return _run_cmd(["parted", "-s", disk, "resizepart", str(num), end_s],
+        timeout=300)
+
+
+def _fs_volume_size(part, fstype):
+    """ファイルシステム自体の現在のサイズ（バイト）を返す。不明時はNone"""
+    fstype = (fstype or "").lower()
+    if fstype in ("ext4", "ext3", "ext2"):
+        if shutil.which("dumpe2fs") is None:
+            return None
+        rc, out = _run_cmd(["dumpe2fs", "-h", part], timeout=60)
+        if rc != 0:
+            return None
+        blocks = bsize = None
+        for line in out.split("\n"):
+            s = line.strip()
+            if s.startswith("Block count:"):
+                try:
+                    blocks = int(s.split(":")[1].strip().split()[0])
+                except Exception:
+                    pass
+            elif s.startswith("Block size:"):
+                try:
+                    bsize = int(s.split(":")[1].strip().split()[0])
+                except Exception:
+                    pass
+        if blocks and bsize:
+            return blocks * bsize
+        return None
+    if fstype == "ntfs":
+        if shutil.which("ntfsresize") is None:
+            return None
+        rc, out = _run_cmd(["ntfsresize", "-f", "--info", part], timeout=300)
+        if rc != 0:
+            return None
+        m = re.search(r"Current volume size:\s*(\d+)\s*bytes", out)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+        return None
+    return None
 
 
 def _part_parent_disk(part):
@@ -1944,7 +2007,7 @@ def part_resize(part, new_size_bytes):
         if new_end_al - start_b < cur_size + MIB:
             return {"ok": False, "error": "アライメント調整後に拡大幅が残りません（サイズを調整してください）"}
         if fstype in ("", "swap"):
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"拡大に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -1952,7 +2015,7 @@ def part_resize(part, new_size_bytes):
         if fstype in ("ext4",):
             if shutil.which("resize2fs") is None or shutil.which("e2fsck") is None:
                 return {"ok": False, "error": "e2fsck/resize2fs が利用できません"}
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"パーティション拡大に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -1968,7 +2031,7 @@ def part_resize(part, new_size_bytes):
         if fstype in ("ntfs",):
             if shutil.which("ntfsresize") is None:
                 return {"ok": False, "error": "ntfsresize が利用できません"}
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"パーティション拡大に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -1978,7 +2041,7 @@ def part_resize(part, new_size_bytes):
             _part_refresh(disk)
             return {"ok": True, "message": f"{part} を拡大しました（NTFS連動）"}
         if fstype in ("xfs", "btrfs"):
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"拡大に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -1988,7 +2051,7 @@ def part_resize(part, new_size_bytes):
         if fstype in ("vfat", "exfat"):
             if fstype == "vfat" and shutil.which("fatresize") is None:
                 return {"ok": False, "error": "vfat のリサイズには fatresize が必要です（未導入のため未対応）"}
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"拡大に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -2011,15 +2074,19 @@ def part_resize(part, new_size_bytes):
         if fstype in ("ext4",):
             if shutil.which("resize2fs") is None or shutil.which("e2fsck") is None:
                 return {"ok": False, "error": "e2fsck/resize2fs が利用できません"}
-            rc, out = _run_cmd(["e2fsck", "-f", "-y", part], timeout=600)
-            if rc not in (0, 1):
-                return {"ok": False, "error": f"ファイルシステム検査に失敗しました: {out[:300]}"}
-            # FSを先に縮小（ブロック単位の切り上げ誤差に備え1MiB余裕を見る）
-            shrink_arg = f"{(new_end_al - start_b) // MIB}M"
-            rc, out = _run_cmd(["resize2fs", part, shrink_arg], timeout=1800)
-            if rc != 0:
-                return {"ok": False, "error": f"ファイルシステム縮小に失敗しました: {out[:300]}"}
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            # FSが既に目標サイズ以下なら（前回FSのみ成功等の再試行）FS縮小をスキップする
+            target_size = new_end_al - start_b
+            vol = _fs_volume_size(part, fstype)
+            if vol is None or vol > target_size:
+                rc, out = _run_cmd(["e2fsck", "-f", "-y", part], timeout=600)
+                if rc not in (0, 1):
+                    return {"ok": False, "error": f"ファイルシステム検査に失敗しました: {out[:300]}"}
+                # FSを先に縮小（ブロック単位の切り上げ誤差に備え1MiB余裕を見る）
+                shrink_arg = f"{(new_end_al - start_b) // MIB}M"
+                rc, out = _run_cmd(["resize2fs", part, shrink_arg], timeout=1800)
+                if rc != 0:
+                    return {"ok": False, "error": f"ファイルシステム縮小に失敗しました: {out[:300]}"}
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"FSは縮小済みですがパーティション縮小に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -2027,11 +2094,16 @@ def part_resize(part, new_size_bytes):
         if fstype in ("ntfs",):
             if shutil.which("ntfsresize") is None:
                 return {"ok": False, "error": "ntfsresize が利用できません"}
-            shrink_arg = f"{(new_end_al - start_b) // (1024 * 1024)}M"
-            rc, out = _run_cmd(["ntfsresize", "-f", "-s", shrink_arg, part], timeout=1800)
-            if rc != 0:
-                return {"ok": False, "error": f"NTFS縮小に失敗しました: {out[:300]}"}
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            # FSが既に目標サイズ以下なら（前回FSのみ成功等の再試行）FS縮小をスキップする
+            target_size = new_end_al - start_b
+            vol = _fs_volume_size(part, fstype)
+            if vol is None or vol > target_size:
+                # バイト指定で端数なく縮小（ntfsresize側でクラスタ境界に切り捨て）
+                shrink_arg = f"{target_size}"
+                rc, out = _run_cmd(["ntfsresize", "-f", "-s", shrink_arg, part], timeout=1800)
+                if rc != 0:
+                    return {"ok": False, "error": f"NTFS縮小に失敗しました: {out[:300]}"}
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"FSは縮小済みですがパーティション縮小に失敗しました: {out[:300]}"}
             _part_refresh(disk)
@@ -2042,14 +2114,14 @@ def part_resize(part, new_size_bytes):
             rc, out = _run_cmd(["fatresize", "-s", f"{(new_end_al - start_b) // MIB}M", part], timeout=1800)
             if rc != 0:
                 return {"ok": False, "error": f"FAT縮小に失敗しました: {out[:300]}"}
-            rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+            rc, out = _parted_resizepart(disk, num, new_end_al)
             if rc != 0:
                 return {"ok": False, "error": f"FSは縮小済みですがパーティション縮小に失敗しました: {out[:300]}"}
             _part_refresh(disk)
             return {"ok": True, "message": f"{part} を縮小しました（vfat連動）"}
         if fstype in ("", "swap"):
             if not fstype:
-                rc, out = _run_cmd(["parted", "-s", disk, "resizepart", str(num), f"{new_end_al}B"], timeout=300)
+                rc, out = _parted_resizepart(disk, num, new_end_al)
                 if rc != 0:
                     return {"ok": False, "error": f"縮小に失敗しました: {out[:300]}"}
                 _part_refresh(disk)
