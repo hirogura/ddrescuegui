@@ -8,6 +8,8 @@
 - デフォルトポート: **3327**
 - 使用ツール: `ddrescue`（Debian では `gddrescue`）, `smartmontools`, `fdisk` / `lsblk`（Arch 系では `util-linux`）, `file`, `git`, `clonezilla`, `partclone`, `rsync`, `parted`
 
+後継ソフトとして「Disk Manager」（ https://github.com/hirogura/diskmanager.git ）を公開しました。
+
 ## インストール
 
 root 権限で実行します。スクリプトは GitHub から最新版をダウンロード（または更新）し、systemd サービスとして登録します。
